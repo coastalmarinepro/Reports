@@ -278,7 +278,7 @@ function compressImage(file) {
   });
 }
 
-function buildInspection(vesselId, type) {
+function buildInspection(vesselId, type, templateSections) {
   const now = new Date();
   return {
     id: uid(),
@@ -296,7 +296,7 @@ function buildInspection(vesselId, type) {
     preparedBy: "Cory - Coastal Marine Pro",
     sections:
       (type || "monthly") === "monthly"
-        ? DEFAULT_SECTIONS.map((s) => ({
+        ? (templateSections || DEFAULT_SECTIONS).map((s) => ({
             name: s.name,
             items: s.items.map((n) => ({
               id: uid(),
@@ -420,8 +420,23 @@ function App() {
     setScreen("vessel");
   }
 
-  function startInspection(type) {
-    const fresh = buildInspection(activeVessel.id, type);
+  async function startInspection(type) {
+    let template = null;
+    if (type === "monthly") {
+      const lastMonthly = index.find(
+        (e) => (e.type || "monthly") === "monthly"
+      );
+      if (lastMonthly) {
+        const prev = await sGet("insp:" + lastMonthly.id);
+        if (prev && prev.sections && prev.sections.length) {
+          template = prev.sections.map((s) => ({
+            name: s.name,
+            items: s.items.map((it) => it.name),
+          }));
+        }
+      }
+    }
+    const fresh = buildInspection(activeVessel.id, type, template);
     setSaveState({ status: "idle", at: null });
     setInsp(fresh);
     setScreen("inspect");
@@ -546,6 +561,17 @@ function App() {
     }));
   }
 
+  function removeItem(sectionIdx, itemId) {
+    setInsp((prev) => ({
+      ...prev,
+      sections: prev.sections.map((s, i) =>
+        i !== sectionIdx
+          ? s
+          : { ...s, items: s.items.filter((it) => it.id !== itemId) }
+      ),
+    }));
+  }
+
   if (loading) {
     return (
       <Shell>
@@ -601,6 +627,7 @@ function App() {
           setInsp={setInsp}
           patchItem={patchItem}
           addCustomItem={addCustomItem}
+          removeItem={removeItem}
           setToast={setToast}
           saveState={saveState}
           saveNow={saveNow}
@@ -1408,6 +1435,7 @@ function InspectScreen({
   setInsp,
   patchItem,
   addCustomItem,
+  removeItem,
   back,
   viewReport,
   setToast,
@@ -1522,6 +1550,7 @@ function InspectScreen({
               si={si}
               patchItem={patchItem}
               addCustomItem={addCustomItem}
+              removeItem={removeItem}
               setToast={setToast}
             />
           ))}
@@ -1625,7 +1654,7 @@ function InspectScreen({
   );
 }
 
-function Section({ sec, si, patchItem, addCustomItem, setToast }) {
+function Section({ sec, si, patchItem, addCustomItem, removeItem, setToast }) {
   const [open, setOpen] = useState(true);
   const [custom, setCustom] = useState("");
   const done = sec.items.filter((i) => i.status).length;
@@ -1681,6 +1710,18 @@ function Section({ sec, si, patchItem, addCustomItem, setToast }) {
               key={it.id}
               item={it}
               onPatch={(p) => patchItem(si, it.id, p)}
+              onRemoveItem={() => {
+                if (
+                  confirm(
+                    'Remove "' +
+                      it.name +
+                      '" from this checklist? Future monthly reports for this vessel will not include it.'
+                  )
+                ) {
+                  (it.photos || []).forEach((ph) => delPhoto(ph.id));
+                  removeItem(si, it.id);
+                }
+              }}
               setToast={setToast}
             />
           ))}
@@ -1805,7 +1846,7 @@ function PhotoStrip({ photos, onRemove, onAddClick, fileRef, onFiles, addLabel }
         ref={fileRef}
         type="file"
         accept="image/*"
-        capture="environment"
+       
         multiple
         onChange={onFiles}
         style={{ display: "none" }}
@@ -1814,7 +1855,7 @@ function PhotoStrip({ photos, onRemove, onAddClick, fileRef, onFiles, addLabel }
   );
 }
 
-function ChecklistItem({ item, onPatch, setToast }) {
+function ChecklistItem({ item, onPatch, onRemoveItem, setToast }) {
   const fileRef = useRef(null);
   const [expanded, setExpanded] = useState(false);
   const showDetail =
@@ -1893,6 +1934,21 @@ function ChecklistItem({ item, onPatch, setToast }) {
             onFiles={(e) => addPhotosFromInput(e, onPatch, setToast)}
             addLabel={"+ Photo"}
           />
+          <button
+            onClick={onRemoveItem}
+            style={{
+              marginTop: 10,
+              background: "transparent",
+              border: "none",
+              color: C.action,
+              fontSize: 12,
+              fontWeight: 700,
+              padding: 0,
+              textDecoration: "underline",
+            }}
+          >
+            Remove this line item
+          </button>
         </div>
       )}
     </div>
