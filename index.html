@@ -1,0 +1,3103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="theme-color" content="#0C1F2C" />
+<title>Coastal Marine Pro · Vessel Reports</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&display=swap" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #F7F6F2; }
+  #root { min-height: 100vh; }
+  .cmp-root { font-family: Archivo, system-ui, -apple-system, sans-serif; color: #0C1F2C; }
+  button { font-family: inherit; cursor: pointer; }
+  input, textarea, select { font-family: inherit; }
+  input:focus, textarea:focus, select:focus, button:focus-visible { outline: 2px solid #B98A44; outline-offset: 1px; }
+  @media print {
+    .no-print { display: none !important; }
+    .print-page { box-shadow: none !important; margin: 0 !important; max-width: none !important; }
+    body, .cmp-root { background: #fff !important; }
+    .report-photo { break-inside: avoid; }
+    .report-item { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useMemo } = React;
+
+/* ============================================================
+   COASTAL MARINE PRO - Vessel Reports (standalone web app)
+   Storage: IndexedDB (built into the phone browser, large
+   capacity, survives closing the browser).
+   Report types: Monthly Service, Post-Service, Diagnostic.
+   ============================================================ */
+
+const C = {
+  ink: "#0C1F2C",
+  inkSoft: "#1C3445",
+  paper: "#F7F6F2",
+  card: "#FFFFFF",
+  brass: "#B98A44",
+  brassDark: "#96702F",
+  good: "#2F7D5B",
+  monitor: "#C28A1F",
+  action: "#BF3B2B",
+  na: "#8A8F94",
+  line: "#DDD8CC",
+  mute: "#5C6B75",
+};
+
+const DEFAULT_SECTIONS = [
+  {
+    name: "Engine & Drive",
+    items: [
+      "Engine oil level & condition",
+      "Gear lube level & condition",
+      "Fuel system / water separator",
+      "Cooling system / telltale flow",
+      "Propeller & hardware",
+      "Anodes (engine / drive)",
+      "Belts, hoses & clamps",
+      "Steering & engine mount hardware",
+    ],
+  },
+  {
+    name: "Electrical & Batteries",
+    items: [
+      "Battery voltage & load test",
+      "Terminals & connections",
+      "Charger / shore power operation",
+      "Bilge pump (auto & manual)",
+      "Navigation & anchor lights",
+      "Helm electronics power-up",
+    ],
+  },
+  {
+    name: "Hull & Exterior",
+    items: [
+      "Hull & gelcoat condition",
+      "Through-hulls & seacocks",
+      "Hull / trim tab anodes",
+      "Bottom paint & growth",
+      "Trim tabs operation",
+    ],
+  },
+  {
+    name: "Lift & Mooring",
+    items: [
+      "Lift cables & pulleys",
+      "Lift motors & switches",
+      "Bunks & guide posts",
+      "Dock lines & chafe points",
+    ],
+  },
+  {
+    name: "Onboard Systems",
+    items: [
+      "Steering fluid & operation",
+      "Livewell / washdown pumps",
+      "Freshwater system",
+      "Head / waste system",
+    ],
+  },
+  {
+    name: "Deck & Interior",
+    items: [
+      "Hatches, latches & drains",
+      "Upholstery & canvas",
+      "Safety equipment check",
+    ],
+  },
+];
+
+const STATUS = {
+  good: { label: "Good", color: C.good, short: "GOOD" },
+  monitor: { label: "Monitor", color: C.monitor, short: "MONITOR" },
+  action: { label: "Action Needed", color: C.action, short: "ACTION" },
+  na: { label: "N/A", color: C.na, short: "N/A" },
+};
+
+const TYPE_META = {
+  monthly: {
+    label: "Monthly Service",
+    sub: "Vessel Readiness Report",
+    color: C.ink,
+    badge: null, // monthly uses the readiness verdict as its badge
+  },
+  service: {
+    label: "Service Visit",
+    sub: "Service Report",
+    color: C.brassDark,
+    badge: "SERVICE",
+  },
+  diagnostic: {
+    label: "Diagnostic",
+    sub: "Diagnostic Report",
+    color: C.action,
+    badge: "DIAGNOSTIC",
+  },
+};
+
+const uid = () =>
+  Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const monthLabel = (d) =>
+  d.toLocaleDateString("en-US", { month: "long", year: "numeric" });
+const dateLabel = (iso) =>
+  new Date(iso).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+
+/* ---------- IndexedDB key-value storage ---------- */
+let lastError = "";
+let _dbp = null;
+function openDB() {
+  if (_dbp) return _dbp;
+  _dbp = new Promise((resolve, reject) => {
+    const req = indexedDB.open("coastal-marine-pro", 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore("kv");
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return _dbp;
+}
+function idb(mode, fn) {
+  return openDB().then(
+    (d) =>
+      new Promise((resolve, reject) => {
+        const tx = d.transaction("kv", mode);
+        const req = fn(tx.objectStore("kv"));
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      })
+  );
+}
+async function sGet(key) {
+  try {
+    const v = await idb("readonly", (s) => s.get(key));
+    return v === undefined ? null : v;
+  } catch (e) {
+    lastError = String((e && e.message) || e);
+    return null;
+  }
+}
+async function sSet(key, val) {
+  try {
+    await idb("readwrite", (s) => s.put(val, key));
+    return true;
+  } catch (e) {
+    lastError = String((e && e.message) || e);
+    console.error("storage set failed", e);
+    return false;
+  }
+}
+async function sDel(key) {
+  try {
+    await idb("readwrite", (s) => s.delete(key));
+  } catch (e) {}
+}
+async function sKeys() {
+  try {
+    return (await idb("readonly", (s) => s.getAllKeys())) || [];
+  } catch (e) {
+    return [];
+  }
+}
+
+/* ---------- photo persistence ---------- */
+const photoCache = {}; // id -> dataUrl for this session
+
+async function savePhoto(id, dataUrl) {
+  photoCache[id] = dataUrl;
+  return sSet("ph:" + id, dataUrl);
+}
+async function loadPhoto(id) {
+  if (photoCache[id]) return photoCache[id];
+  const v = await sGet("ph:" + id);
+  if (v) photoCache[id] = v;
+  return v;
+}
+async function delPhoto(id) {
+  await sDel("ph:" + id);
+  delete photoCache[id];
+}
+async function hydratePhotos(insp) {
+  const ids = [];
+  (insp.sections || []).forEach((s) =>
+    (s.items || []).forEach((it) =>
+      (it.photos || []).forEach((p) => {
+        if (!p.dataUrl) ids.push(p.id);
+      })
+    )
+  );
+  (insp.workLog || []).forEach((w) =>
+    (w.photos || []).forEach((p) => {
+      if (!p.dataUrl) ids.push(p.id);
+    })
+  );
+  for (const id of ids) await loadPhoto(id);
+}
+const photoSrc = (p) => p.dataUrl || photoCache[p.id] || null;
+
+/* ---------- photo compression ---------- */
+function compressImage(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const MAX = 1100;
+        let { width, height } = img;
+        if (width > MAX || height > MAX) {
+          const r = Math.min(MAX / width, MAX / height);
+          width = Math.round(width * r);
+          height = Math.round(height * r);
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL("image/jpeg", 0.65));
+      };
+      img.onerror = reject;
+      img.src = reader.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function buildInspection(vesselId, type) {
+  const now = new Date();
+  return {
+    id: uid(),
+    type: type || "monthly",
+    vesselId,
+    dateISO: now.toISOString(),
+    label: monthLabel(now),
+    engineHours: "",
+    concern: "",
+    diagnosis: "",
+    summary: "",
+    recommendations: "",
+    invoiceNote: "",
+    workLog: [],
+    preparedBy: "Cory - Coastal Marine Pro",
+    sections:
+      (type || "monthly") === "monthly"
+        ? DEFAULT_SECTIONS.map((s) => ({
+            name: s.name,
+            items: s.items.map((n) => ({
+              id: uid(),
+              name: n,
+              status: null,
+              note: "",
+              photos: [],
+            })),
+          }))
+        : [],
+  };
+}
+
+function verdictOf(insp) {
+  let action = 0,
+    monitor = 0,
+    good = 0,
+    pending = 0;
+  (insp.sections || []).forEach((s) =>
+    s.items.forEach((it) => {
+      if (it.status === "action") action++;
+      else if (it.status === "monitor") monitor++;
+      else if (it.status === "good") good++;
+      else if (it.status !== "na") pending++;
+    })
+  );
+  const v = action ? "action" : monitor ? "monitor" : "ready";
+  return { v, action, monitor, good, pending };
+}
+
+/* ============================================================ */
+function App() {
+  const [screen, setScreen] = useState("vessels"); // vessels | vessel | inspect | report | dossier | backup
+  const [vessels, setVessels] = useState([]);
+  const [activeVessel, setActiveVessel] = useState(null);
+  const [index, setIndex] = useState([]);
+  const [insp, setInsp] = useState(null);
+  const [dossier, setDossier] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [toast, setToast] = useState("");
+  const [saveState, setSaveState] = useState({ status: "idle", at: null });
+  const saveTimer = useRef(null);
+  const indexRef = useRef(index);
+  const inspRef = useRef(insp);
+
+  useEffect(() => {
+    indexRef.current = index;
+  }, [index]);
+  useEffect(() => {
+    inspRef.current = insp;
+  }, [insp]);
+
+  useEffect(() => {
+    (async () => {
+      const v = await sGet("vessels");
+      setVessels(v || []);
+      setLoading(false);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(""), 2600);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  /* autosave active report */
+  useEffect(() => {
+    if (!insp) return;
+    setSaveState((s) =>
+      s.status === "error" ? s : { status: "pending", at: s.at }
+    );
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => persist(insp), 600);
+    return () => clearTimeout(saveTimer.current);
+  }, [insp]);
+
+  async function persist(snapshot) {
+    if (!snapshot) return;
+    setSaveState((s) => ({ status: "saving", at: s.at }));
+    const ok = await sSet("insp:" + snapshot.id, snapshot);
+    if (!ok) {
+      setSaveState({ status: "error", at: new Date() });
+      setToast("Save failed: " + (lastError || "unknown error") + ". Tap Save Now to retry.");
+      return;
+    }
+    const { v, action, monitor } = verdictOf(snapshot);
+    const entry = {
+      id: snapshot.id,
+      type: snapshot.type || "monthly",
+      label: snapshot.label,
+      dateISO: snapshot.dateISO,
+      verdict: v,
+      action,
+      monitor,
+    };
+    const idx = [
+      ...indexRef.current.filter((e) => e.id !== snapshot.id),
+      entry,
+    ].sort((a, b) => new Date(b.dateISO) - new Date(a.dateISO));
+    setIndex(idx);
+    await sSet("idx:" + snapshot.vesselId, idx);
+    setSaveState({ status: "saved", at: new Date() });
+  }
+
+  function saveNow() {
+    clearTimeout(saveTimer.current);
+    persist(inspRef.current);
+  }
+
+  async function saveVessels(next) {
+    setVessels(next);
+    const ok = await sSet("vessels", next);
+    if (!ok) setToast("Vessel list did not save: " + (lastError || ""));
+  }
+
+  async function openVessel(v) {
+    setActiveVessel(v);
+    const idx = await sGet("idx:" + v.id);
+    setIndex(idx || []);
+    setScreen("vessel");
+  }
+
+  function startInspection(type) {
+    const fresh = buildInspection(activeVessel.id, type);
+    setSaveState({ status: "idle", at: null });
+    setInsp(fresh);
+    setScreen("inspect");
+  }
+
+  async function openInspection(id, target) {
+    const data = await sGet("insp:" + id);
+    if (!data) {
+      setToast("Could not load that report.");
+      return;
+    }
+    await hydratePhotos(data);
+    setSaveState({ status: "saved", at: new Date() });
+    setInsp(data);
+    setScreen(target);
+  }
+
+  async function deleteInspection(id) {
+    const data = await sGet("insp:" + id);
+    if (data) {
+      const ids = [];
+      (data.sections || []).forEach((s) =>
+        s.items.forEach((it) =>
+          (it.photos || []).forEach((p) => {
+            if (!p.dataUrl) ids.push(p.id);
+          })
+        )
+      );
+      (data.workLog || []).forEach((w) =>
+        (w.photos || []).forEach((p) => {
+          if (!p.dataUrl) ids.push(p.id);
+        })
+      );
+      for (const pid of ids) await delPhoto(pid);
+    }
+    await sDel("insp:" + id);
+    const idx = index.filter((e) => e.id !== id);
+    setIndex(idx);
+    await sSet("idx:" + activeVessel.id, idx);
+  }
+
+  async function deleteVessel(v) {
+    if (
+      !confirm(
+        "Delete " +
+          v.name +
+          " and ALL of its reports and photos permanently? This cannot be undone."
+      )
+    )
+      return;
+    const idx = (await sGet("idx:" + v.id)) || [];
+    for (const e of idx) {
+      const data = await sGet("insp:" + e.id);
+      if (data) {
+        const ids = [];
+        (data.sections || []).forEach((s) =>
+          s.items.forEach((it) =>
+            (it.photos || []).forEach((p) => {
+              if (!p.dataUrl) ids.push(p.id);
+            })
+          )
+        );
+        (data.workLog || []).forEach((w) =>
+          (w.photos || []).forEach((p) => {
+            if (!p.dataUrl) ids.push(p.id);
+          })
+        );
+        for (const pid of ids) await delPhoto(pid);
+      }
+      await sDel("insp:" + e.id);
+    }
+    await sDel("idx:" + v.id);
+    const next = vessels.filter((x) => x.id !== v.id);
+    await saveVessels(next);
+    setScreen("vessels");
+  }
+
+  async function openDossier() {
+    const all = [];
+    for (const e of index) {
+      const d = await sGet("insp:" + e.id);
+      if (d) {
+        await hydratePhotos(d);
+        all.push(d);
+      }
+    }
+    all.sort((a, b) => new Date(a.dateISO) - new Date(b.dateISO));
+    setDossier(all);
+    setScreen("dossier");
+  }
+
+  function patchItem(sectionIdx, itemId, patch) {
+    setInsp((prev) => ({
+      ...prev,
+      sections: prev.sections.map((s, i) => {
+        if (i !== sectionIdx) return s;
+        return {
+          ...s,
+          items: s.items.map((it) =>
+            it.id === itemId
+              ? { ...it, ...(typeof patch === "function" ? patch(it) : patch) }
+              : it
+          ),
+        };
+      }),
+    }));
+  }
+
+  function addCustomItem(sectionIdx, name) {
+    setInsp((prev) => ({
+      ...prev,
+      sections: prev.sections.map((s, i) => {
+        if (i !== sectionIdx) return s;
+        return {
+          ...s,
+          items: [
+            ...s.items,
+            { id: uid(), name, status: null, note: "", photos: [] },
+          ],
+        };
+      }),
+    }));
+  }
+
+  if (loading) {
+    return (
+      <Shell>
+        <div
+          style={{
+            padding: 60,
+            textAlign: "center",
+            color: C.mute,
+          }}
+        >
+          Loading…
+        </div>
+      </Shell>
+    );
+  }
+
+  return (
+    <Shell>
+      {screen === "vessels" && (
+        <VesselsScreen
+          vessels={vessels}
+          saveVessels={saveVessels}
+          openVessel={openVessel}
+          openBackup={() => setScreen("backup")}
+        />
+      )}
+      {screen === "backup" && (
+        <BackupScreen
+          back={() => setScreen("vessels")}
+          setToast={setToast}
+          reloadVessels={async () => {
+            const v = await sGet("vessels");
+            setVessels(v || []);
+          }}
+        />
+      )}
+      {screen === "vessel" && activeVessel && (
+        <VesselScreen
+          vessel={activeVessel}
+          index={index}
+          back={() => setScreen("vessels")}
+          startInspection={startInspection}
+          openInspection={openInspection}
+          deleteInspection={deleteInspection}
+          deleteVessel={deleteVessel}
+          openDossier={openDossier}
+        />
+      )}
+      {screen === "inspect" && insp && (
+        <InspectScreen
+          vessel={activeVessel}
+          insp={insp}
+          setInsp={setInsp}
+          patchItem={patchItem}
+          addCustomItem={addCustomItem}
+          setToast={setToast}
+          saveState={saveState}
+          saveNow={saveNow}
+          back={async () => {
+            saveNow();
+            const idx = await sGet("idx:" + activeVessel.id);
+            setIndex(idx || indexRef.current);
+            setScreen("vessel");
+          }}
+          viewReport={() => {
+            saveNow();
+            setScreen("report");
+          }}
+        />
+      )}
+      {screen === "report" && insp && (
+        <ReportScreen
+          vessel={activeVessel}
+          insp={insp}
+          back={() => setScreen("inspect")}
+        />
+      )}
+      {screen === "dossier" && dossier && (
+        <DossierScreen
+          vessel={activeVessel}
+          reports={dossier}
+          back={() => setScreen("vessel")}
+        />
+      )}
+      {toast && <Toast text={toast} />}
+    </Shell>
+  );
+}
+
+/* ============================ shell ============================ */
+function Shell({ children }) {
+  return (
+    <div style={{ minHeight: "100vh", background: C.paper, color: C.ink }}>
+      <div className="cmp-root">{children}</div>
+    </div>
+  );
+}
+
+function TopBar({ sub, onBack, right }) {
+  return (
+    <div
+      className="no-print"
+      style={{
+        background: C.ink,
+        color: "#fff",
+        padding: "14px 18px",
+        display: "flex",
+        alignItems: "center",
+        gap: 14,
+        position: "sticky",
+        top: 0,
+        zIndex: 20,
+        borderBottom: "3px solid " + C.brass,
+      }}
+    >
+      {onBack && (
+        <button
+          onClick={onBack}
+          aria-label="Back"
+          style={{
+            background: "transparent",
+            border: "1px solid rgba(255,255,255,0.35)",
+            color: "#fff",
+            borderRadius: 6,
+            padding: "6px 12px",
+            fontSize: 13,
+            fontWeight: 600,
+          }}
+        >
+          ← Back
+        </button>
+      )}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div
+          style={{
+            fontWeight: 900,
+            fontSize: 15,
+            letterSpacing: "0.06em",
+            textTransform: "uppercase",
+          }}
+        >
+          Coastal Marine <span style={{ color: C.brass }}>Pro</span>
+        </div>
+        {sub && (
+          <div
+            style={{
+              fontSize: 11,
+              opacity: 0.75,
+              letterSpacing: "0.1em",
+              textTransform: "uppercase",
+            }}
+          >
+            {sub}
+          </div>
+        )}
+      </div>
+      {right}
+    </div>
+  );
+}
+
+function Toast({ text }) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        bottom: 20,
+        left: "50%",
+        transform: "translateX(-50%)",
+        background: C.ink,
+        color: "#fff",
+        padding: "10px 18px",
+        borderRadius: 8,
+        fontSize: 13,
+        zIndex: 100,
+        boxShadow: "0 6px 20px rgba(0,0,0,0.3)",
+        maxWidth: "90vw",
+      }}
+    >
+      {text}
+    </div>
+  );
+}
+
+function PrimaryBtn({ children, onClick, style }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        background: C.brass,
+        color: "#fff",
+        border: "none",
+        borderRadius: 8,
+        padding: "12px 20px",
+        fontWeight: 800,
+        fontSize: 14,
+        letterSpacing: "0.04em",
+        textTransform: "uppercase",
+        ...style,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+const smallBtn = (solid) => ({
+  background: solid ? C.ink : "transparent",
+  color: solid ? "#fff" : C.ink,
+  border: "1px solid " + (solid ? C.ink : C.line),
+  borderRadius: 6,
+  padding: "7px 12px",
+  fontSize: 12,
+  fontWeight: 700,
+});
+
+const inputStyle = () => ({
+  width: "100%",
+  padding: "10px 12px",
+  border: "1px solid " + C.line,
+  borderRadius: 7,
+  fontSize: 14,
+  background: "#fff",
+  color: C.ink,
+});
+
+function FieldLabel({ children }) {
+  return (
+    <div
+      style={{
+        fontSize: 11,
+        fontWeight: 700,
+        textTransform: "uppercase",
+        letterSpacing: "0.08em",
+        color: C.mute,
+        marginBottom: 5,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+/* ====================== save status bar ====================== */
+function SaveBar({ saveState, onSave }) {
+  const cfg =
+    {
+      idle: { bg: "#EEF0EF", color: C.mute, text: "Autosave is on" },
+      pending: { bg: "#FFF6E3", color: C.monitor, text: "Unsaved changes…" },
+      saving: { bg: "#FFF6E3", color: C.monitor, text: "Saving…" },
+      saved: {
+        bg: "#E9F3ED",
+        color: C.good,
+        text:
+          "Saved" +
+          (saveState.at ? " " + saveState.at.toLocaleTimeString() : ""),
+      },
+      error: {
+        bg: "#FBE9E6",
+        color: C.action,
+        text: "NOT SAVED. Tap Save Now.",
+      },
+    }[saveState.status] || { bg: "#EEF0EF", color: C.mute, text: "" };
+
+  return (
+    <div
+      className="no-print"
+      style={{
+        position: "sticky",
+        top: 62,
+        zIndex: 15,
+        background: cfg.bg,
+        border: "1px solid " + C.line,
+        borderLeft: "5px solid " + cfg.color,
+        borderRadius: 8,
+        padding: "8px 12px",
+        marginBottom: 14,
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+      }}
+    >
+      <div
+        style={{
+          flex: 1,
+          fontFamily: "ui-monospace, Menlo, monospace",
+          fontSize: 12,
+          fontWeight: 700,
+          color: cfg.color,
+          letterSpacing: "0.04em",
+        }}
+      >
+        ● {cfg.text}
+      </div>
+      <button
+        onClick={onSave}
+        style={{
+          background: saveState.status === "error" ? C.action : C.ink,
+          color: "#fff",
+          border: "none",
+          borderRadius: 6,
+          padding: "7px 14px",
+          fontSize: 12,
+          fontWeight: 800,
+          letterSpacing: "0.04em",
+          textTransform: "uppercase",
+        }}
+      >
+        Save now
+      </button>
+    </div>
+  );
+}
+
+/* ====================== vessels screen ====================== */
+function VesselsScreen({ vessels, saveVessels, openVessel, openBackup }) {
+  const [adding, setAdding] = useState(false);
+  const [form, setForm] = useState({
+    name: "",
+    owner: "",
+    make: "",
+    location: "",
+    plan: "Management Plan",
+  });
+
+  function submit() {
+    if (!form.name.trim()) return;
+    const v = { id: uid(), ...form };
+    saveVessels([...vessels, v]);
+    setForm({
+      name: "",
+      owner: "",
+      make: "",
+      location: "",
+      plan: "Management Plan",
+    });
+    setAdding(false);
+  }
+
+  return (
+    <div>
+      <TopBar sub="Vessel Management Program" />
+      <div style={{ maxWidth: 760, margin: "0 auto", padding: 18 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            marginBottom: 16,
+          }}
+        >
+          <h1
+            style={{
+              fontSize: 22,
+              fontWeight: 900,
+              margin: 0,
+              letterSpacing: "-0.01em",
+            }}
+          >
+            Managed Vessels
+          </h1>
+          <PrimaryBtn onClick={() => setAdding(!adding)}>
+            {adding ? "Cancel" : "+ Add Vessel"}
+          </PrimaryBtn>
+        </div>
+
+        {adding && (
+          <div
+            style={{
+              background: C.card,
+              border: "1px solid " + C.line,
+              borderRadius: 10,
+              padding: 16,
+              marginBottom: 16,
+            }}
+          >
+            {[
+              ["name", "Vessel name *", "e.g. Top Shelf"],
+              ["owner", "Owner / client", "e.g. Brian R."],
+              ["make", "Make / model / year", "e.g. 2022 Twin Vee 280 GFX"],
+              ["location", "Location / slip", "e.g. Cortez, lift kept"],
+              ["plan", "Plan tier", "Management Plan"],
+            ].map(([k, label, ph]) => (
+              <div key={k} style={{ marginBottom: 10 }}>
+                <FieldLabel>{label}</FieldLabel>
+                <input
+                  value={form[k]}
+                  onChange={(e) => setForm({ ...form, [k]: e.target.value })}
+                  placeholder={ph}
+                  style={inputStyle()}
+                />
+              </div>
+            ))}
+            <PrimaryBtn onClick={submit} style={{ width: "100%" }}>
+              Save vessel
+            </PrimaryBtn>
+          </div>
+        )}
+
+        {vessels.length === 0 && !adding && (
+          <div
+            style={{ textAlign: "center", padding: "60px 20px", color: C.mute }}
+          >
+            <div style={{ fontWeight: 700, marginBottom: 6, color: C.ink }}>
+              No vessels yet
+            </div>
+            <div style={{ fontSize: 14 }}>
+              Add your first managed vessel to start a report.
+            </div>
+          </div>
+        )}
+
+        {vessels.map((v) => (
+          <button
+            key={v.id}
+            onClick={() => openVessel(v)}
+            style={{
+              display: "block",
+              width: "100%",
+              textAlign: "left",
+              background: C.card,
+              border: "1px solid " + C.line,
+              borderLeft: "5px solid " + C.ink,
+              borderRadius: 10,
+              padding: "14px 16px",
+              marginBottom: 10,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "baseline",
+                gap: 10,
+              }}
+            >
+              <div style={{ fontWeight: 800, fontSize: 16 }}>{v.name}</div>
+              <div
+                style={{
+                  fontFamily: "ui-monospace, Menlo, monospace",
+                  fontSize: 11,
+                  color: C.brassDark,
+                }}
+              >
+                {v.plan}
+              </div>
+            </div>
+            <div style={{ fontSize: 13, color: C.mute, marginTop: 3 }}>
+              {[v.owner, v.make, v.location].filter(Boolean).join(" · ")}
+            </div>
+          </button>
+        ))}
+
+        <button
+          onClick={openBackup}
+          style={{
+            width: "100%",
+            marginTop: 14,
+            padding: "12px",
+            background: "transparent",
+            border: "1.5px dashed " + C.mute,
+            borderRadius: 8,
+            color: C.mute,
+            fontWeight: 700,
+            fontSize: 12,
+            letterSpacing: "0.06em",
+            textTransform: "uppercase",
+          }}
+        >
+          Backup & Data
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ====================== backup screen ====================== */
+function BackupScreen({ back, setToast, reloadVessels }) {
+  const [busy, setBusy] = useState(false);
+  const fileRef = useRef(null);
+
+  async function exportBackup() {
+    setBusy(true);
+    try {
+      const keys = await sKeys();
+      const data = {};
+      for (const k of keys) data[k] = await sGet(k);
+      const blob = new Blob(
+        [
+          JSON.stringify({
+            app: "coastal-marine-pro",
+            version: 1,
+            exported: new Date().toISOString(),
+            data,
+          }),
+        ],
+        { type: "application/json" }
+      );
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download =
+        "coastal-marine-pro-backup-" +
+        new Date().toISOString().slice(0, 10) +
+        ".json";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setToast("Backup file created. Save it somewhere safe (Files, iCloud, Drive).");
+    } catch (e) {
+      setToast("Backup failed: " + String((e && e.message) || e));
+    }
+    setBusy(false);
+  }
+
+  async function importBackup(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    if (
+      !confirm(
+        "Restoring a backup REPLACES everything currently in the app with the backup contents. Continue?"
+      )
+    )
+      return;
+    setBusy(true);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      if (!parsed || parsed.app !== "coastal-marine-pro" || !parsed.data)
+        throw new Error("Not a Coastal Marine Pro backup file");
+      const existing = await sKeys();
+      for (const k of existing) await sDel(k);
+      const entries = Object.entries(parsed.data);
+      for (const [k, v] of entries) await sSet(k, v);
+      await reloadVessels();
+      setToast("Backup restored: " + entries.length + " records.");
+    } catch (err) {
+      setToast("Restore failed: " + String((err && err.message) || err));
+    }
+    setBusy(false);
+  }
+
+  async function wipeAll() {
+    if (
+      !confirm(
+        "Delete ALL app data: vessels, reports, and photos. This cannot be undone. Continue?"
+      )
+    )
+      return;
+    setBusy(true);
+    const keys = await sKeys();
+    for (const k of keys) await sDel(k);
+    await reloadVessels();
+    setToast("All app data deleted.");
+    setBusy(false);
+  }
+
+  return (
+    <div>
+      <TopBar sub="Backup & Data" onBack={back} />
+      <div style={{ maxWidth: 760, margin: "0 auto", padding: 18 }}>
+        {busy && (
+          <div style={{ color: C.mute, fontSize: 13, marginBottom: 12 }}>
+            Working…
+          </div>
+        )}
+        <div
+          style={{
+            background: C.card,
+            border: "1px solid " + C.line,
+            borderRadius: 10,
+            padding: 14,
+            marginBottom: 16,
+            fontSize: 13.5,
+            lineHeight: 1.6,
+            color: C.inkSoft,
+          }}
+        >
+          Your reports and photos are stored in this phone's browser database.
+          They survive closing the browser, but clearing browser data or losing
+          the phone would erase them. Export a backup file after each service
+          day and keep it in iCloud or Drive.
+        </div>
+        <PrimaryBtn onClick={exportBackup} style={{ width: "100%", marginBottom: 10 }}>
+          Export full backup
+        </PrimaryBtn>
+        <button
+          onClick={() => fileRef.current && fileRef.current.click()}
+          style={{
+            width: "100%",
+            padding: "13px",
+            background: "transparent",
+            border: "2px solid " + C.ink,
+            borderRadius: 8,
+            color: C.ink,
+            fontWeight: 800,
+            fontSize: 13,
+            letterSpacing: "0.04em",
+            textTransform: "uppercase",
+            marginBottom: 24,
+          }}
+        >
+          Restore from backup file
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="application/json"
+          onChange={importBackup}
+          style={{ display: "none" }}
+        />
+        <button
+          onClick={wipeAll}
+          style={{
+            width: "100%",
+            padding: "12px",
+            background: "transparent",
+            border: "1.5px solid " + C.action,
+            borderRadius: 8,
+            color: C.action,
+            fontWeight: 800,
+            fontSize: 12,
+            letterSpacing: "0.06em",
+            textTransform: "uppercase",
+          }}
+        >
+          Delete all app data
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ====================== vessel screen ====================== */
+function VesselScreen({
+  vessel,
+  index,
+  back,
+  startInspection,
+  openInspection,
+  deleteInspection,
+  deleteVessel,
+  openDossier,
+}) {
+  const VERDICT = {
+    ready: { t: "Vessel Ready", c: C.good },
+    monitor: { t: "Monitor Items", c: C.monitor },
+    action: { t: "Action Required", c: C.action },
+  };
+
+  return (
+    <div>
+      <TopBar sub={vessel.name} onBack={back} />
+      <div style={{ maxWidth: 760, margin: "0 auto", padding: 18 }}>
+        <div
+          style={{
+            background: C.ink,
+            color: "#fff",
+            borderRadius: 10,
+            padding: "16px 18px",
+            marginBottom: 14,
+          }}
+        >
+          <div style={{ fontWeight: 900, fontSize: 20 }}>{vessel.name}</div>
+          <div style={{ fontSize: 13, opacity: 0.8, marginTop: 4 }}>
+            {[vessel.owner, vessel.make, vessel.location]
+              .filter(Boolean)
+              .join(" · ")}
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gap: 8 }}>
+          <PrimaryBtn
+            onClick={() => startInspection("monthly")}
+            style={{ width: "100%", padding: "15px" }}
+          >
+            Monthly service report
+          </PrimaryBtn>
+          <button
+            onClick={() => startInspection("service")}
+            style={{
+              width: "100%",
+              padding: "14px",
+              background: C.brassDark,
+              border: "none",
+              borderRadius: 8,
+              color: "#fff",
+              fontWeight: 800,
+              fontSize: 13,
+              letterSpacing: "0.04em",
+              textTransform: "uppercase",
+            }}
+          >
+            Post-service report
+          </button>
+          <button
+            onClick={() => startInspection("diagnostic")}
+            style={{
+              width: "100%",
+              padding: "14px",
+              background: C.inkSoft,
+              border: "none",
+              borderRadius: 8,
+              color: "#fff",
+              fontWeight: 800,
+              fontSize: 13,
+              letterSpacing: "0.04em",
+              textTransform: "uppercase",
+            }}
+          >
+            Diagnostic report
+          </button>
+        </div>
+
+        {index.length > 0 && (
+          <button
+            onClick={openDossier}
+            style={{
+              width: "100%",
+              marginTop: 10,
+              padding: "14px",
+              background: "transparent",
+              border: "2px solid " + C.ink,
+              borderRadius: 8,
+              color: C.ink,
+              fontWeight: 800,
+              fontSize: 13,
+              letterSpacing: "0.04em",
+              textTransform: "uppercase",
+            }}
+          >
+            Generate vessel history dossier ({index.length}{" "}
+            {index.length === 1 ? "report" : "reports"})
+          </button>
+        )}
+
+        <h2
+          style={{
+            fontSize: 14,
+            textTransform: "uppercase",
+            letterSpacing: "0.1em",
+            color: C.mute,
+            margin: "26px 0 10px",
+          }}
+        >
+          Report history
+        </h2>
+
+        {index.length === 0 && (
+          <div style={{ color: C.mute, fontSize: 14, padding: "10px 0" }}>
+            No reports yet for this vessel.
+          </div>
+        )}
+
+        {index.map((e) => {
+          const tm = TYPE_META[e.type || "monthly"];
+          const vd = tm.badge
+            ? { t: tm.badge, c: tm.color }
+            : VERDICT[
+                e.verdict === "action"
+                  ? "action"
+                  : e.verdict === "monitor"
+                  ? "monitor"
+                  : "ready"
+              ];
+          return (
+            <div
+              key={e.id}
+              style={{
+                background: C.card,
+                border: "1px solid " + C.line,
+                borderRadius: 10,
+                padding: "12px 14px",
+                marginBottom: 10,
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                flexWrap: "wrap",
+              }}
+            >
+              <div style={{ flex: 1, minWidth: 140 }}>
+                <div style={{ fontWeight: 800 }}>{e.label}</div>
+                <div style={{ fontSize: 12, color: C.mute }}>
+                  {dateLabel(e.dateISO)} · {tm.label}
+                </div>
+              </div>
+              <div
+                style={{
+                  fontFamily: "ui-monospace, Menlo, monospace",
+                  fontSize: 11,
+                  fontWeight: 700,
+                  color: vd.c,
+                  border: "1.5px solid " + vd.c,
+                  borderRadius: 5,
+                  padding: "3px 8px",
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase",
+                }}
+              >
+                {vd.t}
+              </div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button
+                  onClick={() => openInspection(e.id, "inspect")}
+                  style={smallBtn()}
+                >
+                  Edit
+                </button>
+                <button
+                  onClick={() => openInspection(e.id, "report")}
+                  style={smallBtn(true)}
+                >
+                  View
+                </button>
+                <button
+                  onClick={() => {
+                    if (confirm("Delete this report permanently?"))
+                      deleteInspection(e.id);
+                  }}
+                  style={{
+                    ...smallBtn(),
+                    color: C.action,
+                    borderColor: C.action,
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+          );
+        })}
+
+        <button
+          onClick={() => deleteVessel(vessel)}
+          style={{
+            width: "100%",
+            marginTop: 24,
+            padding: "11px",
+            background: "transparent",
+            border: "1.5px dashed " + C.action,
+            borderRadius: 8,
+            color: C.action,
+            fontWeight: 700,
+            fontSize: 12,
+            letterSpacing: "0.06em",
+            textTransform: "uppercase",
+          }}
+        >
+          Delete this vessel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ====================== inspect screen ====================== */
+function InspectScreen({
+  vessel,
+  insp,
+  setInsp,
+  patchItem,
+  addCustomItem,
+  back,
+  viewReport,
+  setToast,
+  saveState,
+  saveNow,
+}) {
+  const stats = useMemo(() => verdictOf(insp), [insp]);
+  const type = insp.type || "monthly";
+  const tm = TYPE_META[type];
+
+  return (
+    <div>
+      <TopBar
+        sub={vessel.name + " - " + tm.label}
+        onBack={back}
+        right={
+          <button
+            onClick={viewReport}
+            style={{
+              background: C.brass,
+              color: "#fff",
+              border: "none",
+              borderRadius: 6,
+              padding: "8px 14px",
+              fontSize: 13,
+              fontWeight: 800,
+              textTransform: "uppercase",
+              letterSpacing: "0.04em",
+            }}
+          >
+            Report →
+          </button>
+        }
+      />
+      <div style={{ maxWidth: 760, margin: "0 auto", padding: 18 }}>
+        <SaveBar saveState={saveState} onSave={saveNow} />
+
+        {type === "monthly" && (
+          <div
+            style={{
+              display: "flex",
+              gap: 14,
+              background: C.card,
+              border: "1px solid " + C.line,
+              borderRadius: 10,
+              padding: "10px 14px",
+              marginBottom: 16,
+              flexWrap: "wrap",
+              fontFamily: "ui-monospace, Menlo, monospace",
+              fontSize: 12,
+            }}
+          >
+            <span style={{ color: C.good, fontWeight: 700 }}>
+              ● {stats.good} good
+            </span>
+            <span style={{ color: C.monitor, fontWeight: 700 }}>
+              ● {stats.monitor} monitor
+            </span>
+            <span style={{ color: C.action, fontWeight: 700 }}>
+              ● {stats.action} action
+            </span>
+            <span style={{ color: C.mute }}>○ {stats.pending} unchecked</span>
+          </div>
+        )}
+
+        <div
+          style={{
+            background: C.card,
+            border: "1px solid " + C.line,
+            borderRadius: 10,
+            padding: 14,
+            marginBottom: 16,
+          }}
+        >
+          <FieldLabel>Engine hours (optional)</FieldLabel>
+          <input
+            value={insp.engineHours}
+            onChange={(e) => setInsp({ ...insp, engineHours: e.target.value })}
+            placeholder="e.g. 412.6"
+            inputMode="decimal"
+            style={inputStyle()}
+          />
+        </div>
+
+        {type === "diagnostic" && (
+          <div
+            style={{
+              background: C.card,
+              border: "1px solid " + C.line,
+              borderLeft: "5px solid " + C.action,
+              borderRadius: 10,
+              padding: 14,
+              marginBottom: 16,
+            }}
+          >
+            <FieldLabel>Reported concern / symptom</FieldLabel>
+            <textarea
+              value={insp.concern}
+              onChange={(e) => setInsp({ ...insp, concern: e.target.value })}
+              placeholder="What the owner reported. e.g. Port engine alarm at 3500 RPM, intermittent."
+              rows={3}
+              style={{ ...inputStyle(), resize: "vertical" }}
+            />
+          </div>
+        )}
+
+        {type === "monthly" &&
+          insp.sections.map((sec, si) => (
+            <Section
+              key={sec.name}
+              sec={sec}
+              si={si}
+              patchItem={patchItem}
+              addCustomItem={addCustomItem}
+              setToast={setToast}
+            />
+          ))}
+
+        <WorkLog
+          insp={insp}
+          setInsp={setInsp}
+          setToast={setToast}
+          title={
+            type === "diagnostic"
+              ? "Testing & Inspection Performed"
+              : "Work Performed This Visit"
+          }
+        />
+
+        {type === "diagnostic" && (
+          <div
+            style={{
+              background: C.card,
+              border: "1px solid " + C.line,
+              borderLeft: "5px solid " + C.brassDark,
+              borderRadius: 10,
+              padding: 14,
+              marginBottom: 16,
+            }}
+          >
+            <FieldLabel>Diagnosis / root cause</FieldLabel>
+            <textarea
+              value={insp.diagnosis}
+              onChange={(e) => setInsp({ ...insp, diagnosis: e.target.value })}
+              placeholder="What was found and why it's happening."
+              rows={3}
+              style={{ ...inputStyle(), resize: "vertical" }}
+            />
+          </div>
+        )}
+
+        <div
+          style={{
+            background: C.card,
+            border: "1px solid " + C.line,
+            borderRadius: 10,
+            padding: 14,
+            marginBottom: 16,
+          }}
+        >
+          {type !== "diagnostic" && (
+            <React.Fragment>
+              <FieldLabel>
+                {type === "service"
+                  ? "Service summary (appears at top of client report)"
+                  : "This month's service summary"}
+              </FieldLabel>
+              <textarea
+                value={insp.summary}
+                onChange={(e) => setInsp({ ...insp, summary: e.target.value })}
+                placeholder="What was done this visit, overall condition, anything the owner should know."
+                rows={3}
+                style={{ ...inputStyle(), resize: "vertical" }}
+              />
+              <div style={{ height: 12 }} />
+            </React.Fragment>
+          )}
+          <FieldLabel>
+            {type === "diagnostic"
+              ? "Recommended repair / next steps"
+              : "Recommendations / upcoming"}
+          </FieldLabel>
+          <textarea
+            value={insp.recommendations}
+            onChange={(e) =>
+              setInsp({ ...insp, recommendations: e.target.value })
+            }
+            placeholder={
+              type === "diagnostic"
+                ? "What you recommend doing about it, and in what order."
+                : "What you recommend addressing next, and when."
+            }
+            rows={3}
+            style={{ ...inputStyle(), resize: "vertical" }}
+          />
+          <div style={{ height: 12 }} />
+          <FieldLabel>Billing note (optional)</FieldLabel>
+          <input
+            value={insp.invoiceNote}
+            onChange={(e) => setInsp({ ...insp, invoiceNote: e.target.value })}
+            placeholder="e.g. Invoice to follow separately. We'll go over numbers together."
+            style={inputStyle()}
+          />
+        </div>
+
+        <PrimaryBtn
+          onClick={viewReport}
+          style={{ width: "100%", marginTop: 18, padding: 16 }}
+        >
+          Generate client report
+        </PrimaryBtn>
+        <div style={{ height: 40 }} />
+      </div>
+    </div>
+  );
+}
+
+function Section({ sec, si, patchItem, addCustomItem, setToast }) {
+  const [open, setOpen] = useState(true);
+  const [custom, setCustom] = useState("");
+  const done = sec.items.filter((i) => i.status).length;
+
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <button
+        onClick={() => setOpen(!open)}
+        style={{
+          width: "100%",
+          textAlign: "left",
+          background: C.ink,
+          color: "#fff",
+          border: "none",
+          borderRadius: open ? "10px 10px 0 0" : 10,
+          padding: "12px 14px",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+        }}
+      >
+        <span
+          style={{
+            fontWeight: 800,
+            letterSpacing: "0.04em",
+            textTransform: "uppercase",
+            fontSize: 13,
+          }}
+        >
+          {sec.name}
+        </span>
+        <span
+          style={{
+            fontFamily: "ui-monospace, Menlo, monospace",
+            fontSize: 12,
+            opacity: 0.8,
+          }}
+        >
+          {done}/{sec.items.length} {open ? "▾" : "▸"}
+        </span>
+      </button>
+      {open && (
+        <div
+          style={{
+            background: C.card,
+            border: "1px solid " + C.line,
+            borderTop: "none",
+            borderRadius: "0 0 10px 10px",
+          }}
+        >
+          {sec.items.map((it) => (
+            <ChecklistItem
+              key={it.id}
+              item={it}
+              onPatch={(p) => patchItem(si, it.id, p)}
+              setToast={setToast}
+            />
+          ))}
+          <div style={{ padding: "10px 14px", display: "flex", gap: 8 }}>
+            <input
+              value={custom}
+              onChange={(e) => setCustom(e.target.value)}
+              placeholder="Add custom line item…"
+              style={{ ...inputStyle(), flex: 1 }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && custom.trim()) {
+                  addCustomItem(si, custom.trim());
+                  setCustom("");
+                }
+              }}
+            />
+            <button
+              onClick={() => {
+                if (custom.trim()) {
+                  addCustomItem(si, custom.trim());
+                  setCustom("");
+                }
+              }}
+              style={smallBtn(true)}
+            >
+              Add
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* shared photo add flow: persist each photo the moment it's taken */
+async function addPhotosFromInput(e, onPatch, setToast) {
+  const files = Array.from(e.target.files || []);
+  e.target.value = "";
+  for (const f of files) {
+    try {
+      const dataUrl = await compressImage(f);
+      const id = uid();
+      const ok = await savePhoto(id, dataUrl);
+      if (!ok) {
+        setToast("Photo save failed: " + (lastError || "unknown error"));
+        continue;
+      }
+      onPatch((prev) => ({ photos: [...(prev.photos || []), { id }] }));
+    } catch (err) {
+      setToast("Couldn't process that photo.");
+    }
+  }
+}
+
+function PhotoStrip({ photos, onRemove, onAddClick, fileRef, onFiles, addLabel }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        gap: 8,
+        marginTop: 8,
+        flexWrap: "wrap",
+        alignItems: "center",
+      }}
+    >
+      {photos.map((p) => {
+        const src = photoSrc(p);
+        if (!src) return null;
+        return (
+          <div key={p.id} style={{ position: "relative" }}>
+            <img
+              src={src}
+              alt=""
+              style={{
+                width: 76,
+                height: 76,
+                objectFit: "cover",
+                borderRadius: 7,
+                border: "1px solid " + C.line,
+              }}
+            />
+            <button
+              onClick={() => onRemove(p.id)}
+              aria-label="Remove photo"
+              style={{
+                position: "absolute",
+                top: -6,
+                right: -6,
+                width: 20,
+                height: 20,
+                borderRadius: "50%",
+                border: "none",
+                background: C.action,
+                color: "#fff",
+                fontSize: 11,
+                lineHeight: "20px",
+                padding: 0,
+              }}
+            >
+              ✕
+            </button>
+          </div>
+        );
+      })}
+      <button
+        onClick={onAddClick}
+        style={{
+          width: 76,
+          height: 76,
+          borderRadius: 7,
+          border: "1.5px dashed " + C.line,
+          background: "transparent",
+          color: C.mute,
+          fontSize: 11,
+          fontWeight: 700,
+          lineHeight: 1.3,
+        }}
+      >
+        {addLabel}
+      </button>
+      <input
+        ref={fileRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        multiple
+        onChange={onFiles}
+        style={{ display: "none" }}
+      />
+    </div>
+  );
+}
+
+function ChecklistItem({ item, onPatch, setToast }) {
+  const fileRef = useRef(null);
+  const [expanded, setExpanded] = useState(false);
+  const showDetail =
+    expanded ||
+    item.note ||
+    item.photos.length > 0 ||
+    item.status === "monitor" ||
+    item.status === "action";
+
+  return (
+    <div style={{ borderBottom: "1px solid " + C.line, padding: "12px 14px" }}>
+      <div
+        style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}
+      >
+        <div style={{ flex: 1, minWidth: 160, fontSize: 14, fontWeight: 600 }}>
+          {item.name}
+        </div>
+        <div style={{ display: "flex", gap: 5 }}>
+          {Object.entries(STATUS).map(([key, s]) => (
+            <button
+              key={key}
+              onClick={() =>
+                onPatch({ status: item.status === key ? null : key })
+              }
+              aria-pressed={item.status === key}
+              style={{
+                border: "1.5px solid " + (item.status === key ? s.color : C.line),
+                background: item.status === key ? s.color : "transparent",
+                color: item.status === key ? "#fff" : C.mute,
+                borderRadius: 6,
+                padding: "6px 9px",
+                fontSize: 11,
+                fontWeight: 800,
+                letterSpacing: "0.04em",
+                fontFamily: "ui-monospace, Menlo, monospace",
+              }}
+            >
+              {s.short}
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={() => setExpanded(!showDetail ? true : !expanded)}
+          aria-label="Add note or photo"
+          style={{
+            background: "transparent",
+            border: "1px solid " + C.line,
+            borderRadius: 6,
+            padding: "6px 9px",
+            fontSize: 12,
+            color: C.mute,
+          }}
+        >
+          ＋
+        </button>
+      </div>
+      {showDetail && (
+        <div style={{ marginTop: 10 }}>
+          <textarea
+            value={item.note}
+            onChange={(e) => onPatch({ note: e.target.value })}
+            placeholder="Notes for this item (shows on client report)…"
+            rows={2}
+            style={{ ...inputStyle(), resize: "vertical", fontSize: 13 }}
+          />
+          <PhotoStrip
+            photos={item.photos}
+            onRemove={(pid) => {
+              onPatch((prev) => ({
+                photos: prev.photos.filter((x) => x.id !== pid),
+              }));
+              delPhoto(pid);
+            }}
+            onAddClick={() => fileRef.current && fileRef.current.click()}
+            fileRef={fileRef}
+            onFiles={(e) => addPhotosFromInput(e, onPatch, setToast)}
+            addLabel={"+ Photo"}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WorkLog({ insp, setInsp, setToast, title }) {
+  const [open, setOpen] = useState(true);
+  const log = insp.workLog || [];
+
+  function addEntry() {
+    setInsp((prev) => ({
+      ...prev,
+      workLog: [
+        ...(prev.workLog || []),
+        { id: uid(), title: "", detail: "", parts: "", photos: [] },
+      ],
+    }));
+  }
+  function patchEntry(id, patch) {
+    setInsp((prev) => ({
+      ...prev,
+      workLog: (prev.workLog || []).map((e) =>
+        e.id === id
+          ? { ...e, ...(typeof patch === "function" ? patch(e) : patch) }
+          : e
+      ),
+    }));
+  }
+  function removeEntry(id) {
+    setInsp((prev) => ({
+      ...prev,
+      workLog: (prev.workLog || []).filter((e) => e.id !== id),
+    }));
+  }
+
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <button
+        onClick={() => setOpen(!open)}
+        style={{
+          width: "100%",
+          textAlign: "left",
+          background: C.brassDark,
+          color: "#fff",
+          border: "none",
+          borderRadius: open ? "10px 10px 0 0" : 10,
+          padding: "12px 14px",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+        }}
+      >
+        <span
+          style={{
+            fontWeight: 800,
+            letterSpacing: "0.04em",
+            textTransform: "uppercase",
+            fontSize: 13,
+          }}
+        >
+          {title}
+        </span>
+        <span
+          style={{
+            fontFamily: "ui-monospace, Menlo, monospace",
+            fontSize: 12,
+            opacity: 0.85,
+          }}
+        >
+          {log.length} {open ? "▾" : "▸"}
+        </span>
+      </button>
+      {open && (
+        <div
+          style={{
+            background: C.card,
+            border: "1px solid " + C.line,
+            borderTop: "none",
+            borderRadius: "0 0 10px 10px",
+            padding: 14,
+          }}
+        >
+          {log.length === 0 && (
+            <div style={{ fontSize: 13, color: C.mute, marginBottom: 10 }}>
+              Log each item with photos. These build the vessel's permanent
+              service record.
+            </div>
+          )}
+          {log.map((e) => (
+            <WorkEntry
+              key={e.id}
+              entry={e}
+              onPatch={(p) => patchEntry(e.id, p)}
+              onRemove={() => removeEntry(e.id)}
+              setToast={setToast}
+            />
+          ))}
+          <button
+            onClick={addEntry}
+            style={{
+              width: "100%",
+              padding: "11px",
+              background: "transparent",
+              border: "1.5px dashed " + C.brassDark,
+              borderRadius: 8,
+              color: C.brassDark,
+              fontWeight: 800,
+              fontSize: 13,
+            }}
+          >
+            + Log an entry
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WorkEntry({ entry, onPatch, onRemove, setToast }) {
+  const fileRef = useRef(null);
+
+  return (
+    <div
+      style={{
+        border: "1px solid " + C.line,
+        borderLeft: "4px solid " + C.brassDark,
+        borderRadius: "0 8px 8px 0",
+        padding: 12,
+        marginBottom: 12,
+      }}
+    >
+      <div style={{ display: "flex", gap: 8 }}>
+        <input
+          value={entry.title}
+          onChange={(e) => onPatch({ title: e.target.value })}
+          placeholder="What was done, e.g. Replaced raw water intake hose clamps"
+          style={{ ...inputStyle(), flex: 1, fontWeight: 700 }}
+        />
+        <button
+          onClick={onRemove}
+          aria-label="Remove entry"
+          style={{ ...smallBtn(), color: C.action, borderColor: C.action }}
+        >
+          ✕
+        </button>
+      </div>
+      <textarea
+        value={entry.detail}
+        onChange={(e) => onPatch({ detail: e.target.value })}
+        placeholder="Details: what was found, what was done, condition after."
+        rows={2}
+        style={{ ...inputStyle(), resize: "vertical", fontSize: 13, marginTop: 8 }}
+      />
+      <input
+        value={entry.parts}
+        onChange={(e) => onPatch({ parts: e.target.value })}
+        placeholder="Parts / materials used (optional)"
+        style={{ ...inputStyle(), fontSize: 13, marginTop: 8 }}
+      />
+      <PhotoStrip
+        photos={entry.photos}
+        onRemove={(pid) => {
+          onPatch((prev) => ({
+            photos: prev.photos.filter((x) => x.id !== pid),
+          }));
+          delPhoto(pid);
+        }}
+        onAddClick={() => fileRef.current && fileRef.current.click()}
+        fileRef={fileRef}
+        onFiles={(e) => addPhotosFromInput(e, onPatch, setToast)}
+        addLabel={"+ Before / After"}
+      />
+    </div>
+  );
+}
+
+/* ====================== report screen ====================== */
+function ReportScreen({ vessel, insp, back }) {
+  const stats = verdictOf(insp);
+  const type = insp.type || "monthly";
+  const tm = TYPE_META[type];
+  const VERDICT = {
+    ready: {
+      t: "VESSEL READY",
+      c: C.good,
+      blurb: "All systems inspected and in service condition.",
+    },
+    monitor: {
+      t: "MONITOR ITEMS",
+      c: C.monitor,
+      blurb:
+        "Vessel is in service condition. Items below are being tracked and will be re-checked next visit.",
+    },
+    action: {
+      t: "ACTION REQUIRED",
+      c: C.action,
+      blurb: "Items below need attention to keep the vessel ready.",
+    },
+  };
+  const stamp =
+    type === "monthly"
+      ? VERDICT[stats.v]
+      : type === "service"
+      ? {
+          t: "WORK COMPLETED",
+          c: C.good,
+          blurb: "All work below was performed and verified this visit.",
+        }
+      : {
+          t: "DIAGNOSTIC FINDINGS",
+          c: C.brassDark,
+          blurb: "Testing, findings, and recommended repair documented below.",
+        };
+
+  const findings = [];
+  (insp.sections || []).forEach((s) =>
+    s.items.forEach((it) => {
+      if (
+        it.status === "action" ||
+        it.status === "monitor" ||
+        (it.note && it.status) ||
+        it.photos.length > 0
+      ) {
+        if (it.status && it.status !== "na")
+          findings.push({ ...it, section: s.name });
+      }
+    })
+  );
+  findings.sort(
+    (a, b) =>
+      (a.status === "action" ? -1 : 1) - (b.status === "action" ? -1 : 1)
+  );
+
+  const workEntries = (insp.workLog || []).filter((w) => w.title.trim());
+
+  return (
+    <div style={{ background: "#E9E6DE", minHeight: "100vh" }}>
+      <TopBar
+        sub="Client report preview"
+        onBack={back}
+        right={
+          <button
+            onClick={() => window.print()}
+            style={{
+              background: C.brass,
+              color: "#fff",
+              border: "none",
+              borderRadius: 6,
+              padding: "8px 14px",
+              fontSize: 13,
+              fontWeight: 800,
+              textTransform: "uppercase",
+            }}
+          >
+            Print / PDF
+          </button>
+        }
+      />
+      <div
+        className="print-page"
+        style={{
+          maxWidth: 740,
+          margin: "20px auto",
+          background: "#fff",
+          boxShadow: "0 8px 30px rgba(0,0,0,0.15)",
+        }}
+      >
+        {/* Header plate */}
+        <div
+          style={{
+            background: C.ink,
+            color: "#fff",
+            padding: "26px 30px",
+            borderBottom: "4px solid " + C.brass,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "flex-start",
+              gap: 14,
+              flexWrap: "wrap",
+            }}
+          >
+            <div>
+              <div
+                style={{
+                  fontWeight: 900,
+                  fontSize: 22,
+                  letterSpacing: "0.05em",
+                  textTransform: "uppercase",
+                }}
+              >
+                Coastal Marine <span style={{ color: C.brass }}>Pro</span>
+              </div>
+              <div
+                style={{
+                  fontFamily: "ui-monospace, Menlo, monospace",
+                  fontSize: 11,
+                  letterSpacing: "0.18em",
+                  opacity: 0.8,
+                  marginTop: 4,
+                  textTransform: "uppercase",
+                }}
+              >
+                {tm.sub}
+              </div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontWeight: 800, fontSize: 16 }}>{insp.label}</div>
+              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                Service date: {dateLabel(insp.dateISO)}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Spec strip */}
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+            borderBottom: "1px solid " + C.line,
+          }}
+        >
+          {[
+            ["Vessel", vessel.name],
+            ["Owner", vessel.owner || "—"],
+            ["Make / Model", vessel.make || "—"],
+            ["Location", vessel.location || "—"],
+            ...(insp.engineHours ? [["Engine hours", insp.engineHours]] : []),
+          ].map(([k, v]) => (
+            <div
+              key={k}
+              style={{ padding: "12px 16px", borderRight: "1px solid " + C.line }}
+            >
+              <div
+                style={{
+                  fontFamily: "ui-monospace, Menlo, monospace",
+                  fontSize: 10,
+                  letterSpacing: "0.12em",
+                  color: C.mute,
+                  textTransform: "uppercase",
+                }}
+              >
+                {k}
+              </div>
+              <div style={{ fontWeight: 700, fontSize: 14, marginTop: 2 }}>
+                {v}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ padding: "26px 30px" }}>
+          {/* Stamp */}
+          <div
+            style={{
+              border: "3px solid " + stamp.c,
+              borderRadius: 8,
+              padding: "16px 20px",
+              display: "flex",
+              alignItems: "center",
+              gap: 18,
+              flexWrap: "wrap",
+              marginBottom: 26,
+            }}
+          >
+            <div
+              style={{
+                fontFamily: "ui-monospace, Menlo, monospace",
+                fontWeight: 800,
+                fontSize: 18,
+                letterSpacing: "0.14em",
+                color: stamp.c,
+              }}
+            >
+              {stamp.t}
+            </div>
+            <div style={{ fontSize: 13, color: C.inkSoft, flex: 1, minWidth: 180 }}>
+              {stamp.blurb}
+            </div>
+            {type === "monthly" && (
+              <div
+                style={{
+                  display: "flex",
+                  gap: 14,
+                  fontFamily: "ui-monospace, Menlo, monospace",
+                  fontSize: 11,
+                  fontWeight: 700,
+                }}
+              >
+                <span style={{ color: C.good }}>{stats.good} GOOD</span>
+                <span style={{ color: C.monitor }}>{stats.monitor} MONITOR</span>
+                <span style={{ color: C.action }}>{stats.action} ACTION</span>
+              </div>
+            )}
+          </div>
+
+          {/* Diagnostic: reported concern */}
+          {type === "diagnostic" && insp.concern && (
+            <ReportBlock title="Reported concern">
+              <p
+                style={{
+                  margin: 0,
+                  fontSize: 14,
+                  lineHeight: 1.6,
+                  whiteSpace: "pre-wrap",
+                }}
+              >
+                {insp.concern}
+              </p>
+            </ReportBlock>
+          )}
+
+          {/* Summary */}
+          {type !== "diagnostic" && insp.summary && (
+            <ReportBlock
+              title={
+                type === "service" ? "Work summary" : "This month's service"
+              }
+            >
+              <p
+                style={{
+                  margin: 0,
+                  fontSize: 14,
+                  lineHeight: 1.6,
+                  whiteSpace: "pre-wrap",
+                }}
+              >
+                {insp.summary}
+              </p>
+            </ReportBlock>
+          )}
+
+          {/* Work performed / testing performed */}
+          {workEntries.length > 0 && (
+            <ReportBlock
+              title={
+                type === "diagnostic"
+                  ? "Testing & inspection performed"
+                  : "Work performed this visit"
+              }
+            >
+              {workEntries.map((w) => (
+                <div
+                  key={w.id}
+                  className="report-item"
+                  style={{
+                    borderLeft: "4px solid " + C.brassDark,
+                    background: "#FAF9F6",
+                    borderRadius: "0 8px 8px 0",
+                    padding: "12px 14px",
+                    marginBottom: 12,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      gap: 10,
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <div style={{ fontWeight: 800, fontSize: 14 }}>{w.title}</div>
+                    <div
+                      style={{
+                        fontFamily: "ui-monospace, Menlo, monospace",
+                        fontSize: 10,
+                        color: C.brassDark,
+                        letterSpacing: "0.1em",
+                      }}
+                    >
+                      {type === "diagnostic" ? "TEST / INSPECTION" : "REPAIR / CORRECTION"}
+                    </div>
+                  </div>
+                  {w.detail && (
+                    <div
+                      style={{
+                        fontSize: 13,
+                        lineHeight: 1.55,
+                        marginTop: 6,
+                        whiteSpace: "pre-wrap",
+                      }}
+                    >
+                      {w.detail}
+                    </div>
+                  )}
+                  {w.parts && (
+                    <div style={{ fontSize: 12, color: C.mute, marginTop: 4 }}>
+                      Parts: {w.parts}
+                    </div>
+                  )}
+                  {w.photos.length > 0 && (
+                    <div
+                      style={{
+                        display: "flex",
+                        gap: 8,
+                        marginTop: 10,
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      {w.photos.map((p) => {
+                        const src = photoSrc(p);
+                        if (!src) return null;
+                        return (
+                          <img
+                            key={p.id}
+                            src={src}
+                            alt=""
+                            className="report-photo"
+                            style={{
+                              width: 150,
+                              height: 112,
+                              objectFit: "cover",
+                              borderRadius: 6,
+                              border: "1px solid " + C.line,
+                            }}
+                          />
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </ReportBlock>
+          )}
+
+          {/* Diagnostic: diagnosis */}
+          {type === "diagnostic" && insp.diagnosis && (
+            <ReportBlock title="Diagnosis">
+              <div
+                className="report-item"
+                style={{
+                  borderLeft: "4px solid " + C.action,
+                  background: "#FAF9F6",
+                  borderRadius: "0 8px 8px 0",
+                  padding: "14px 16px",
+                  fontSize: 14,
+                  lineHeight: 1.6,
+                  whiteSpace: "pre-wrap",
+                  fontWeight: 600,
+                }}
+              >
+                {insp.diagnosis}
+              </div>
+            </ReportBlock>
+          )}
+
+          {/* Monthly findings */}
+          {type === "monthly" && findings.length > 0 && (
+            <ReportBlock title="Findings & documentation">
+              {findings.map((f) => (
+                <div
+                  key={f.id}
+                  className="report-item"
+                  style={{
+                    borderLeft: "4px solid " + STATUS[f.status].color,
+                    background: "#FAF9F6",
+                    borderRadius: "0 8px 8px 0",
+                    padding: "12px 14px",
+                    marginBottom: 12,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      gap: 10,
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <div style={{ fontWeight: 800, fontSize: 14 }}>{f.name}</div>
+                    <div
+                      style={{
+                        fontFamily: "ui-monospace, Menlo, monospace",
+                        fontSize: 10,
+                        fontWeight: 700,
+                        letterSpacing: "0.1em",
+                        color: STATUS[f.status].color,
+                      }}
+                    >
+                      {f.section.toUpperCase()} · {STATUS[f.status].short}
+                    </div>
+                  </div>
+                  {f.note && (
+                    <div
+                      style={{
+                        fontSize: 13,
+                        lineHeight: 1.55,
+                        marginTop: 6,
+                        whiteSpace: "pre-wrap",
+                      }}
+                    >
+                      {f.note}
+                    </div>
+                  )}
+                  {f.photos.length > 0 && (
+                    <div
+                      style={{
+                        display: "flex",
+                        gap: 8,
+                        marginTop: 10,
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      {f.photos.map((p) => {
+                        const src = photoSrc(p);
+                        if (!src) return null;
+                        return (
+                          <img
+                            key={p.id}
+                            src={src}
+                            alt=""
+                            className="report-photo"
+                            style={{
+                              width: 150,
+                              height: 112,
+                              objectFit: "cover",
+                              borderRadius: 6,
+                              border: "1px solid " + C.line,
+                            }}
+                          />
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </ReportBlock>
+          )}
+
+          {/* Monthly checklist */}
+          {type === "monthly" && (
+            <ReportBlock title="Inspection checklist">
+              {insp.sections.map((s) => {
+                const checked = s.items.filter((i) => i.status);
+                if (!checked.length) return null;
+                return (
+                  <div key={s.name} style={{ marginBottom: 14 }}>
+                    <div
+                      style={{
+                        fontFamily: "ui-monospace, Menlo, monospace",
+                        fontSize: 11,
+                        fontWeight: 700,
+                        letterSpacing: "0.1em",
+                        color: C.mute,
+                        textTransform: "uppercase",
+                        marginBottom: 4,
+                      }}
+                    >
+                      {s.name}
+                    </div>
+                    {checked.map((it) => (
+                      <div
+                        key={it.id}
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          gap: 10,
+                          padding: "4px 0",
+                          borderBottom: "1px dotted " + C.line,
+                          fontSize: 13,
+                        }}
+                      >
+                        <span>{it.name}</span>
+                        <span
+                          style={{
+                            fontFamily: "ui-monospace, Menlo, monospace",
+                            fontSize: 11,
+                            fontWeight: 700,
+                            color: STATUS[it.status].color,
+                          }}
+                        >
+                          {STATUS[it.status].short}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+            </ReportBlock>
+          )}
+
+          {/* Recommendations */}
+          {insp.recommendations && (
+            <ReportBlock
+              title={
+                type === "diagnostic" ? "Recommended repair" : "Recommendations"
+              }
+            >
+              <p
+                style={{
+                  margin: 0,
+                  fontSize: 14,
+                  lineHeight: 1.6,
+                  whiteSpace: "pre-wrap",
+                }}
+              >
+                {insp.recommendations}
+              </p>
+            </ReportBlock>
+          )}
+
+          {/* Billing note */}
+          {insp.invoiceNote && (
+            <div
+              style={{
+                border: "1.5px dashed " + C.brassDark,
+                borderRadius: 8,
+                padding: "12px 16px",
+                marginBottom: 22,
+                fontSize: 13,
+                color: C.inkSoft,
+              }}
+            >
+              <span
+                style={{
+                  fontFamily: "ui-monospace, Menlo, monospace",
+                  fontSize: 10,
+                  fontWeight: 700,
+                  letterSpacing: "0.12em",
+                  color: C.brassDark,
+                  textTransform: "uppercase",
+                  marginRight: 8,
+                }}
+              >
+                Billing
+              </span>
+              {insp.invoiceNote}
+            </div>
+          )}
+
+          {/* Footer */}
+          <div
+            style={{
+              borderTop: "2px solid " + C.ink,
+              marginTop: 26,
+              paddingTop: 14,
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 12,
+              flexWrap: "wrap",
+            }}
+          >
+            <div>
+              <div style={{ fontWeight: 800, fontSize: 13 }}>
+                {insp.preparedBy}
+              </div>
+              <div style={{ fontSize: 12, color: C.mute }}>
+                Mobile marine service · Bradenton / Sarasota / Parrish
+              </div>
+            </div>
+            <div
+              style={{
+                fontFamily: "ui-monospace, Menlo, monospace",
+                fontSize: 11,
+                color: C.brassDark,
+                letterSpacing: "0.14em",
+              }}
+            >
+              WE KEEP YOUR BOAT READY.
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style={{ height: 30 }} className="no-print" />
+    </div>
+  );
+}
+
+function ReportBlock({ title, children }) {
+  return (
+    <div style={{ marginBottom: 22 }}>
+      <div
+        style={{
+          fontWeight: 900,
+          fontSize: 13,
+          textTransform: "uppercase",
+          letterSpacing: "0.1em",
+          borderBottom: "2px solid " + C.ink,
+          paddingBottom: 6,
+          marginBottom: 12,
+        }}
+      >
+        {title}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+/* ====================== dossier screen ====================== */
+function DossierScreen({ vessel, reports, back }) {
+  const first = reports[0];
+  const last = reports[reports.length - 1];
+  const hoursSeries = reports
+    .filter((r) => r.engineHours)
+    .map((r) => ({ label: r.label, h: r.engineHours }));
+  const allWork = reports.flatMap((r) =>
+    (r.workLog || [])
+      .filter((w) => w.title.trim())
+      .map((w) => ({ ...w, when: r.label, dateISO: r.dateISO }))
+  );
+  const VERDICT = {
+    ready: ["READY", C.good],
+    monitor: ["MONITOR", C.monitor],
+    action: ["ACTION", C.action],
+  };
+
+  return (
+    <div style={{ background: "#E9E6DE", minHeight: "100vh" }}>
+      <TopBar
+        sub="Vessel history dossier"
+        onBack={back}
+        right={
+          <button
+            onClick={() => window.print()}
+            style={{
+              background: C.brass,
+              color: "#fff",
+              border: "none",
+              borderRadius: 6,
+              padding: "8px 14px",
+              fontSize: 13,
+              fontWeight: 800,
+              textTransform: "uppercase",
+            }}
+          >
+            Print / PDF
+          </button>
+        }
+      />
+      <div
+        className="print-page"
+        style={{
+          maxWidth: 740,
+          margin: "20px auto",
+          background: "#fff",
+          boxShadow: "0 8px 30px rgba(0,0,0,0.15)",
+        }}
+      >
+        {/* Cover plate */}
+        <div
+          style={{
+            background: C.ink,
+            color: "#fff",
+            padding: "34px 30px",
+            borderBottom: "4px solid " + C.brass,
+          }}
+        >
+          <div
+            style={{
+              fontFamily: "ui-monospace, Menlo, monospace",
+              fontSize: 11,
+              letterSpacing: "0.2em",
+              opacity: 0.8,
+              textTransform: "uppercase",
+            }}
+          >
+            Documented Vessel History
+          </div>
+          <div
+            style={{
+              fontWeight: 900,
+              fontSize: 30,
+              marginTop: 8,
+              letterSpacing: "-0.01em",
+            }}
+          >
+            {vessel.name}
+          </div>
+          <div style={{ fontSize: 14, opacity: 0.85, marginTop: 4 }}>
+            {[vessel.make, vessel.location].filter(Boolean).join(" · ")}
+          </div>
+          <div style={{ display: "flex", gap: 26, marginTop: 22, flexWrap: "wrap" }}>
+            {[
+              ["Reports on file", reports.length],
+              [
+                "Coverage",
+                dateLabel(first.dateISO) + " – " + dateLabel(last.dateISO),
+              ],
+              ...(hoursSeries.length
+                ? [
+                    [
+                      "Engine hours",
+                      hoursSeries[0].h +
+                        " → " +
+                        hoursSeries[hoursSeries.length - 1].h,
+                    ],
+                  ]
+                : []),
+              ["Documented repairs", allWork.length],
+            ].map(([k, v]) => (
+              <div key={k}>
+                <div
+                  style={{
+                    fontFamily: "ui-monospace, Menlo, monospace",
+                    fontSize: 10,
+                    letterSpacing: "0.14em",
+                    opacity: 0.7,
+                    textTransform: "uppercase",
+                  }}
+                >
+                  {k}
+                </div>
+                <div style={{ fontWeight: 800, fontSize: 17, marginTop: 2 }}>
+                  {v}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ padding: "26px 30px" }}>
+          <div
+            style={{
+              fontSize: 13.5,
+              lineHeight: 1.65,
+              color: C.inkSoft,
+              marginBottom: 24,
+            }}
+          >
+            This vessel has been maintained under the Coastal Marine Pro
+            management program. Every visit below is documented with
+            inspection, photographs, and a log of all work performed. Records
+            are presented in chronological order.
+          </div>
+
+          {/* Timeline */}
+          <ReportBlock title="Service timeline">
+            <div style={{ overflowX: "auto" }}>
+              <table
+                style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}
+              >
+                <thead>
+                  <tr
+                    style={{
+                      textAlign: "left",
+                      fontFamily: "ui-monospace, Menlo, monospace",
+                      fontSize: 10,
+                      letterSpacing: "0.1em",
+                      color: C.mute,
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    <th style={{ padding: "6px 8px 6px 0" }}>Visit</th>
+                    <th style={{ padding: "6px 8px" }}>Date</th>
+                    <th style={{ padding: "6px 8px" }}>Type</th>
+                    <th style={{ padding: "6px 8px" }}>Hours</th>
+                    <th style={{ padding: "6px 8px" }}>Entries</th>
+                    <th style={{ padding: "6px 0 6px 8px" }}>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {reports.map((r) => {
+                    const tmm = TYPE_META[r.type || "monthly"];
+                    const st = verdictOf(r);
+                    const badge = tmm.badge
+                      ? [tmm.badge, tmm.color]
+                      : VERDICT[st.v];
+                    return (
+                      <tr key={r.id} style={{ borderTop: "1px solid " + C.line }}>
+                        <td style={{ padding: "8px 8px 8px 0", fontWeight: 700 }}>
+                          {r.label}
+                        </td>
+                        <td style={{ padding: "8px" }}>{dateLabel(r.dateISO)}</td>
+                        <td style={{ padding: "8px" }}>{tmm.label}</td>
+                        <td
+                          style={{
+                            padding: "8px",
+                            fontFamily: "ui-monospace, Menlo, monospace",
+                          }}
+                        >
+                          {r.engineHours || "—"}
+                        </td>
+                        <td style={{ padding: "8px" }}>
+                          {(r.workLog || []).filter((w) => w.title.trim()).length}
+                        </td>
+                        <td style={{ padding: "8px 0 8px 8px" }}>
+                          <span
+                            style={{
+                              fontFamily: "ui-monospace, Menlo, monospace",
+                              fontSize: 11,
+                              fontWeight: 700,
+                              color: badge[1],
+                            }}
+                          >
+                            {badge[0]}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </ReportBlock>
+
+          {/* Complete repair record */}
+          {allWork.length > 0 && (
+            <ReportBlock title="Complete repair & maintenance record">
+              {allWork.map((w) => (
+                <div
+                  key={w.id}
+                  className="report-item"
+                  style={{
+                    borderLeft: "4px solid " + C.brassDark,
+                    background: "#FAF9F6",
+                    borderRadius: "0 8px 8px 0",
+                    padding: "12px 14px",
+                    marginBottom: 12,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      gap: 10,
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <div style={{ fontWeight: 800, fontSize: 14 }}>{w.title}</div>
+                    <div
+                      style={{
+                        fontFamily: "ui-monospace, Menlo, monospace",
+                        fontSize: 10,
+                        color: C.brassDark,
+                        letterSpacing: "0.1em",
+                      }}
+                    >
+                      {w.when.toUpperCase()}
+                    </div>
+                  </div>
+                  {w.detail && (
+                    <div
+                      style={{
+                        fontSize: 13,
+                        lineHeight: 1.55,
+                        marginTop: 6,
+                        whiteSpace: "pre-wrap",
+                      }}
+                    >
+                      {w.detail}
+                    </div>
+                  )}
+                  {w.parts && (
+                    <div style={{ fontSize: 12, color: C.mute, marginTop: 4 }}>
+                      Parts: {w.parts}
+                    </div>
+                  )}
+                  {w.photos.length > 0 && (
+                    <div
+                      style={{
+                        display: "flex",
+                        gap: 8,
+                        marginTop: 10,
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      {w.photos.map((p) => {
+                        const src = photoSrc(p);
+                        if (!src) return null;
+                        return (
+                          <img
+                            key={p.id}
+                            src={src}
+                            alt=""
+                            className="report-photo"
+                            style={{
+                              width: 150,
+                              height: 112,
+                              objectFit: "cover",
+                              borderRadius: 6,
+                              border: "1px solid " + C.line,
+                            }}
+                          />
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </ReportBlock>
+          )}
+
+          {/* Findings per visit */}
+          <ReportBlock title="Inspection findings by visit">
+            {reports.map((r) => {
+              const finds = [];
+              (r.sections || []).forEach((s) =>
+                s.items.forEach((it) => {
+                  if (
+                    it.status === "action" ||
+                    it.status === "monitor" ||
+                    (it.note && it.status)
+                  ) {
+                    finds.push({ ...it, section: s.name });
+                  }
+                })
+              );
+              if (r.type === "diagnostic" && r.diagnosis) {
+                finds.push({
+                  id: r.id + "-diag",
+                  status: "action",
+                  name: "Diagnosis",
+                  note: r.diagnosis,
+                });
+              }
+              return (
+                <div key={r.id} style={{ marginBottom: 16 }}>
+                  <div
+                    style={{
+                      fontFamily: "ui-monospace, Menlo, monospace",
+                      fontSize: 11,
+                      fontWeight: 700,
+                      letterSpacing: "0.1em",
+                      color: C.mute,
+                      textTransform: "uppercase",
+                      marginBottom: 4,
+                    }}
+                  >
+                    {r.label} · {TYPE_META[r.type || "monthly"].label}
+                  </div>
+                  {finds.length === 0 ? (
+                    <div style={{ fontSize: 13, color: C.good, fontWeight: 600 }}>
+                      All inspected systems in good condition.
+                    </div>
+                  ) : (
+                    finds.map((f) => (
+                      <div
+                        key={f.id}
+                        style={{
+                          display: "flex",
+                          gap: 10,
+                          padding: "5px 0",
+                          borderBottom: "1px dotted " + C.line,
+                          fontSize: 13,
+                        }}
+                      >
+                        <span
+                          style={{
+                            fontFamily: "ui-monospace, Menlo, monospace",
+                            fontSize: 11,
+                            fontWeight: 700,
+                            color: STATUS[f.status].color,
+                            minWidth: 62,
+                          }}
+                        >
+                          {STATUS[f.status].short}
+                        </span>
+                        <span>
+                          <strong>{f.name}</strong>
+                          {f.note ? " : " + f.note : ""}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              );
+            })}
+          </ReportBlock>
+
+          {/* Footer */}
+          <div
+            style={{
+              borderTop: "2px solid " + C.ink,
+              marginTop: 26,
+              paddingTop: 14,
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 12,
+              flexWrap: "wrap",
+            }}
+          >
+            <div>
+              <div style={{ fontWeight: 800, fontSize: 13 }}>
+                Coastal Marine Pro
+              </div>
+              <div style={{ fontSize: 12, color: C.mute }}>
+                Mobile marine service · Bradenton / Sarasota / Parrish
+              </div>
+            </div>
+            <div
+              style={{
+                fontFamily: "ui-monospace, Menlo, monospace",
+                fontSize: 11,
+                color: C.brassDark,
+                letterSpacing: "0.14em",
+              }}
+            >
+              DOCUMENTED. MAINTAINED. READY.
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style={{ height: 30 }} className="no-print" />
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
