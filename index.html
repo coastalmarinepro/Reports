@@ -232,6 +232,13 @@ async function delPhoto(id) {
   await sDel("ph:" + id);
   delete photoCache[id];
 }
+async function copyPhoto(id) {
+  const srcUrl = await loadPhoto(id);
+  if (!srcUrl) return null;
+  const nid = uid();
+  const ok = await savePhoto(nid, srcUrl);
+  return ok ? nid : null;
+}
 async function hydratePhotos(insp) {
   const ids = [];
   (insp.sections || []).forEach((s) =>
@@ -335,10 +342,12 @@ function App() {
   const [index, setIndex] = useState([]);
   const [insp, setInsp] = useState(null);
   const [dossier, setDossier] = useState(null);
+  const [tasks, setTasks] = useState([]);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState("");
   const [saveState, setSaveState] = useState({ status: "idle", at: null });
   const saveTimer = useRef(null);
+  const tasksTimer = useRef(null);
   const indexRef = useRef(index);
   const inspRef = useRef(insp);
 
@@ -373,6 +382,16 @@ function App() {
     saveTimer.current = setTimeout(() => persist(insp), 600);
     return () => clearTimeout(saveTimer.current);
   }, [insp]);
+
+  /* autosave work list */
+  useEffect(() => {
+    if (!activeVessel) return;
+    clearTimeout(tasksTimer.current);
+    tasksTimer.current = setTimeout(() => {
+      sSet("tasks:" + activeVessel.id, tasks);
+    }, 500);
+    return () => clearTimeout(tasksTimer.current);
+  }, [tasks]);
 
   async function persist(snapshot) {
     if (!snapshot) return;
@@ -417,6 +436,10 @@ function App() {
     setActiveVessel(v);
     const idx = await sGet("idx:" + v.id);
     setIndex(idx || []);
+    const t = (await sGet("tasks:" + v.id)) || [];
+    for (const task of t)
+      for (const ph of task.photos || []) await loadPhoto(ph.id);
+    setTasks(t);
     setScreen("vessel");
   }
 
@@ -509,6 +532,10 @@ function App() {
       await sDel("insp:" + e.id);
     }
     await sDel("idx:" + v.id);
+    const vtasks = (await sGet("tasks:" + v.id)) || [];
+    for (const t of vtasks)
+      for (const ph of t.photos || []) await delPhoto(ph.id);
+    await sDel("tasks:" + v.id);
     const next = vessels.filter((x) => x.id !== v.id);
     await saveVessels(next);
     setScreen("vessels");
@@ -572,6 +599,35 @@ function App() {
     }));
   }
 
+  async function pullTaskToReport(task) {
+    const newPhotos = [];
+    for (const ph of task.photos || []) {
+      const nid = await copyPhoto(ph.id);
+      if (nid) newPhotos.push({ id: nid });
+    }
+    setInsp((prev) => ({
+      ...prev,
+      workLog: [
+        ...(prev.workLog || []),
+        {
+          id: uid(),
+          title: task.title || "Owner-requested item",
+          detail: task.detail || "",
+          parts: "",
+          photos: newPhotos,
+        },
+      ],
+    }));
+    const next = tasks.map((t) =>
+      t.id === task.id
+        ? { ...t, status: "done", doneISO: new Date().toISOString() }
+        : t
+    );
+    setTasks(next);
+    await sSet("tasks:" + activeVessel.id, next);
+    setToast("Added to this report's work log.");
+  }
+
   if (loading) {
     return (
       <Shell>
@@ -612,6 +668,8 @@ function App() {
         <VesselScreen
           vessel={activeVessel}
           index={index}
+          taskCount={tasks.filter((t) => t.status !== "done").length}
+          openTasks={() => setScreen("tasks")}
           back={() => setScreen("vessels")}
           startInspection={startInspection}
           openInspection={openInspection}
@@ -620,10 +678,21 @@ function App() {
           openDossier={openDossier}
         />
       )}
+      {screen === "tasks" && activeVessel && (
+        <TasksScreen
+          vessel={activeVessel}
+          tasks={tasks}
+          setTasks={setTasks}
+          back={() => setScreen("vessel")}
+          setToast={setToast}
+        />
+      )}
       {screen === "inspect" && insp && (
         <InspectScreen
           vessel={activeVessel}
           insp={insp}
+          openTasksList={tasks.filter((t) => t.status !== "done")}
+          pullTask={pullTaskToReport}
           setInsp={setInsp}
           patchItem={patchItem}
           addCustomItem={addCustomItem}
@@ -1210,6 +1279,8 @@ function BackupScreen({ back, setToast, reloadVessels }) {
 function VesselScreen({
   vessel,
   index,
+  taskCount,
+  openTasks,
   back,
   startInspection,
   openInspection,
@@ -1286,6 +1357,25 @@ function VesselScreen({
             Diagnostic report
           </button>
         </div>
+
+        <button
+          onClick={openTasks}
+          style={{
+            width: "100%",
+            marginTop: 10,
+            padding: "14px",
+            background: taskCount > 0 ? C.monitor : "transparent",
+            border: "2px solid " + (taskCount > 0 ? C.monitor : C.line),
+            borderRadius: 8,
+            color: taskCount > 0 ? "#fff" : C.inkSoft,
+            fontWeight: 800,
+            fontSize: 13,
+            letterSpacing: "0.04em",
+            textTransform: "uppercase",
+          }}
+        >
+          Work list ({taskCount} open)
+        </button>
 
         {index.length > 0 && (
           <button
@@ -1432,6 +1522,8 @@ function VesselScreen({
 function InspectScreen({
   vessel,
   insp,
+  openTasksList,
+  pullTask,
   setInsp,
   patchItem,
   addCustomItem,
@@ -1472,6 +1564,46 @@ function InspectScreen({
       />
       <div style={{ maxWidth: 760, margin: "0 auto", padding: 18 }}>
         <SaveBar saveState={saveState} onSave={saveNow} />
+
+        {openTasksList && openTasksList.length > 0 && (
+          <div
+            style={{
+              background: "#FFF6E3",
+              border: "1px solid " + C.line,
+              borderLeft: "5px solid " + C.monitor,
+              borderRadius: 10,
+              padding: 14,
+              marginBottom: 16,
+            }}
+          >
+            <FieldLabel>Open work list for this vessel</FieldLabel>
+            {openTasksList.map((t) => (
+              <div
+                key={t.id}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  padding: "8px 0",
+                  borderBottom: "1px dotted " + C.line,
+                  flexWrap: "wrap",
+                }}
+              >
+                <div style={{ flex: 1, minWidth: 140 }}>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>
+                    {t.title || "Untitled item"}
+                  </div>
+                  {t.detail && (
+                    <div style={{ fontSize: 12, color: C.mute }}>{t.detail}</div>
+                  )}
+                </div>
+                <button onClick={() => pullTask(t)} style={smallBtn(true)}>
+                  Log on this report
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
 
         {type === "monthly" && (
           <div
@@ -3148,6 +3280,226 @@ function DossierScreen({ vessel, reports, back }) {
         </div>
       </div>
       <div style={{ height: 30 }} className="no-print" />
+    </div>
+  );
+}
+
+/* ====================== work list screen ====================== */
+function TasksScreen({ vessel, tasks, setTasks, back, setToast }) {
+  const open = tasks.filter((t) => t.status !== "done");
+  const done = tasks.filter((t) => t.status === "done");
+  const [showDone, setShowDone] = useState(false);
+
+  function addTask() {
+    setTasks([
+      {
+        id: uid(),
+        title: "",
+        detail: "",
+        photos: [],
+        createdISO: new Date().toISOString(),
+        status: "open",
+      },
+      ...tasks,
+    ]);
+  }
+  function patchTask(id, patch) {
+    setTasks(
+      tasks.map((t) =>
+        t.id === id
+          ? { ...t, ...(typeof patch === "function" ? patch(t) : patch) }
+          : t
+      )
+    );
+  }
+  function completeTask(id) {
+    setTasks(
+      tasks.map((t) =>
+        t.id === id
+          ? { ...t, status: "done", doneISO: new Date().toISOString() }
+          : t
+      )
+    );
+  }
+  function reopenTask(id) {
+    setTasks(
+      tasks.map((t) =>
+        t.id === id ? { ...t, status: "open", doneISO: null } : t
+      )
+    );
+  }
+  function deleteTask(t) {
+    if (!confirm("Delete this work list item permanently?")) return;
+    (t.photos || []).forEach((ph) => delPhoto(ph.id));
+    setTasks(tasks.filter((x) => x.id !== t.id));
+  }
+
+  return (
+    <div>
+      <TopBar sub={vessel.name + " - Work List"} onBack={back} />
+      <div style={{ maxWidth: 760, margin: "0 auto", padding: 18 }}>
+        <div
+          style={{
+            fontSize: 13.5,
+            lineHeight: 1.6,
+            color: C.inkSoft,
+            marginBottom: 14,
+          }}
+        >
+          Owner requests and items to handle on a future visit. Log them the
+          moment the text comes in. Open items appear automatically when you
+          start a report on this vessel, with a one-tap button to log them as
+          work performed.
+        </div>
+        <PrimaryBtn onClick={addTask} style={{ width: "100%", marginBottom: 16 }}>
+          + Add work list item
+        </PrimaryBtn>
+        {open.length === 0 && (
+          <div style={{ color: C.mute, fontSize: 14, marginBottom: 16 }}>
+            No open items.
+          </div>
+        )}
+        {open.map((t) => (
+          <TaskCard
+            key={t.id}
+            task={t}
+            onPatch={(p) => patchTask(t.id, p)}
+            onComplete={() => completeTask(t.id)}
+            onDelete={() => deleteTask(t)}
+            setToast={setToast}
+          />
+        ))}
+        {done.length > 0 && (
+          <button
+            onClick={() => setShowDone(!showDone)}
+            style={{ ...smallBtn(), width: "100%", marginTop: 8, padding: "10px" }}
+          >
+            {showDone ? "Hide" : "Show"} completed ({done.length})
+          </button>
+        )}
+        {showDone &&
+          done.map((t) => (
+            <div
+              key={t.id}
+              style={{
+                background: C.card,
+                border: "1px solid " + C.line,
+                borderLeft: "5px solid " + C.good,
+                borderRadius: 10,
+                padding: "10px 14px",
+                marginTop: 10,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  flexWrap: "wrap",
+                }}
+              >
+                <div style={{ flex: 1, minWidth: 140 }}>
+                  <div
+                    style={{
+                      fontWeight: 700,
+                      fontSize: 13,
+                      textDecoration: "line-through",
+                      color: C.mute,
+                    }}
+                  >
+                    {t.title || "Untitled item"}
+                  </div>
+                  <div style={{ fontSize: 11, color: C.mute }}>
+                    Completed {t.doneISO ? dateLabel(t.doneISO) : ""}
+                  </div>
+                </div>
+                <button onClick={() => reopenTask(t.id)} style={smallBtn()}>
+                  Reopen
+                </button>
+                <button
+                  onClick={() => deleteTask(t)}
+                  style={{ ...smallBtn(), color: C.action, borderColor: C.action }}
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+          ))}
+        <div style={{ height: 40 }} />
+      </div>
+    </div>
+  );
+}
+
+function TaskCard({ task, onPatch, onComplete, onDelete, setToast }) {
+  const fileRef = useRef(null);
+  return (
+    <div
+      style={{
+        background: C.card,
+        border: "1px solid " + C.line,
+        borderLeft: "5px solid " + C.monitor,
+        borderRadius: 10,
+        padding: 12,
+        marginBottom: 12,
+      }}
+    >
+      <div style={{ fontSize: 11, color: C.mute, marginBottom: 6 }}>
+        Added {dateLabel(task.createdISO)}
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input
+          value={task.title}
+          onChange={(e) => onPatch({ title: e.target.value })}
+          placeholder="What to check or fix, e.g. Owner reports livewell pump weak"
+          style={{ ...inputStyle(), flex: 1, fontWeight: 700 }}
+        />
+        <button
+          onClick={onDelete}
+          aria-label="Delete item"
+          style={{ ...smallBtn(), color: C.action, borderColor: C.action }}
+        >
+          ✕
+        </button>
+      </div>
+      <textarea
+        value={task.detail}
+        onChange={(e) => onPatch({ detail: e.target.value })}
+        placeholder="Details from the owner, parts to bring, where it is on the boat."
+        rows={2}
+        style={{ ...inputStyle(), resize: "vertical", fontSize: 13, marginTop: 8 }}
+      />
+      <PhotoStrip
+        photos={task.photos || []}
+        onRemove={(pid) => {
+          onPatch((prev) => ({
+            photos: (prev.photos || []).filter((x) => x.id !== pid),
+          }));
+          delPhoto(pid);
+        }}
+        onAddClick={() => fileRef.current && fileRef.current.click()}
+        fileRef={fileRef}
+        onFiles={(e) => addPhotosFromInput(e, onPatch, setToast)}
+        addLabel={"+ Photo"}
+      />
+      <button
+        onClick={onComplete}
+        style={{
+          marginTop: 10,
+          width: "100%",
+          padding: "10px",
+          background: C.good,
+          border: "none",
+          borderRadius: 8,
+          color: "#fff",
+          fontWeight: 800,
+          fontSize: 12,
+          letterSpacing: "0.04em",
+          textTransform: "uppercase",
+        }}
+      >
+        Mark complete (without logging)
+      </button>
     </div>
   );
 }
