@@ -118,6 +118,38 @@ const DEFAULT_SECTIONS = [
   },
 ];
 
+// Critical-systems priority for the GOOD TO GO list (lower = higher priority).
+// Matched by case-insensitive keyword against the item name.
+const CRITICAL_ORDER = [
+  ["engine", 0], ["motor", 0],
+  ["generator", 1], ["gen ", 1],
+  ["steering", 2], ["helm", 2],
+  ["battery", 3], ["batteries", 3], ["electrical", 3], ["voltage", 3],
+  ["charger", 3], ["shore power", 3], ["terminal", 3],
+  ["bilge", 4], ["pump", 4],
+  ["fuel", 5], ["water separator", 5],
+  ["hull", 6], ["through-hull", 6], ["seacock", 6], ["anode", 6], ["bottom", 6],
+  ["gelcoat", 6], ["trim tab", 6],
+  ["air conditioning", 7], ["ac ", 7], ["seakeeper", 7], ["windlass", 7],
+  ["livewell", 7], ["washdown", 7], ["freshwater", 7], ["head", 7],
+  ["nav", 7], ["light", 7], ["electronics", 7],
+  ["hatch", 8], ["upholstery", 8], ["canvas", 8], ["safety", 8], ["deck", 8],
+];
+function criticalRank(name) {
+  const n = (name || "").toLowerCase();
+  for (const [kw, rank] of CRITICAL_ORDER) {
+    if (n.indexOf(kw) !== -1) return rank;
+  }
+  return 6.5; // unknown items sit mid-pack
+}
+
+// Default Boat Stock, trimmed per vessel like the checklist.
+const DEFAULT_STOCK = {
+  engine: ["Engine oil", "Oil filter", "Fuel filter / water separator", "Impeller", "Gear lube", "Spark plugs"],
+  generator: ["Generator oil", "Generator oil filter", "Generator impeller", "Generator fuel filter"],
+  boat: ["Steering fluid", "Descaling fluid", "Strainer baskets", "Zincs / anodes", "Coolant"],
+};
+
 const STATUS = {
   good: { label: "Good", color: C.good, short: "GOOD" },
   monitor: { label: "Monitor", color: C.monitor, short: "MONITOR" },
@@ -133,10 +165,16 @@ const TYPE_META = {
     badge: null, // monthly uses the readiness verdict as its badge
   },
   service: {
-    label: "Service Visit",
-    sub: "Service Report",
+    label: "Repair",
+    sub: "Repair Report",
     color: C.brassDark,
-    badge: "SERVICE",
+    badge: "REPAIR",
+  },
+  repair: {
+    label: "Repair",
+    sub: "Repair Report",
+    color: C.brassDark,
+    badge: "REPAIR",
   },
   diagnostic: {
     label: "Diagnostic",
@@ -217,6 +255,21 @@ async function sKeys() {
 
 /* ---------- photo persistence ---------- */
 const photoCache = {}; // id -> dataUrl for this session
+let subListCache = null;
+async function getSubs() {
+  if (subListCache) return subListCache;
+  subListCache = (await sGet("subs")) || [];
+  return subListCache;
+}
+async function rememberSub(name) {
+  const n = (name || "").trim();
+  if (!n || n === "Self") return;
+  const list = await getSubs();
+  if (!list.some((s) => s.toLowerCase() === n.toLowerCase())) {
+    subListCache = [...list, n].sort();
+    await sSet("subs", subListCache);
+  }
+}
 
 async function savePhoto(id, dataUrl) {
   photoCache[id] = dataUrl;
@@ -248,11 +301,14 @@ async function hydratePhotos(insp) {
       })
     )
   );
-  (insp.workLog || []).forEach((w) =>
+  (insp.workLog || []).forEach((w) => {
     (w.photos || []).forEach((p) => {
       if (!p.dataUrl) ids.push(p.id);
-    })
-  );
+    });
+    (w.invoicePhotos || []).forEach((p) => {
+      if (!p.dataUrl) ids.push(p.id);
+    });
+  });
   for (const id of ids) await loadPhoto(id);
 }
 const photoSrc = (p) => p.dataUrl || photoCache[p.id] || null;
@@ -294,12 +350,16 @@ function buildInspection(vesselId, type, templateSections) {
     dateISO: now.toISOString(),
     label: monthLabel(now),
     engineHours: "",
+    generatorHours: "",
+    reportTitle: "",
     concern: "",
     diagnosis: "",
     summary: "",
     recommendations: "",
     invoiceNote: "",
     workLog: [],
+    stock: [],
+    migratedV2: true,
     preparedBy: "Cory - Coastal Marine Pro",
     sections:
       (type || "monthly") === "monthly"
@@ -332,6 +392,48 @@ function verdictOf(insp) {
   );
   const v = action ? "action" : monitor ? "monitor" : "ready";
   return { v, action, monitor, good, pending };
+}
+
+// Build the display name for a report based on type.
+function reportName(insp) {
+  const t = insp.type || "monthly";
+  if (t === "monthly") return insp.label + " Checklist";
+  const title = (insp.reportTitle || "").trim();
+  if (t === "diagnostic")
+    return "Diagnostic: " + (title || insp.concern || "Untitled");
+  if (t === "service" || t === "repair")
+    return "Repair: " + (title || (insp.workLog && insp.workLog[0] && insp.workLog[0].title) || "Untitled");
+  return insp.label;
+}
+
+// One-time per-report migration to the current data shape.
+function migrateInspection(d) {
+  if (!d) return d;
+  let changed = false;
+  // old "service" type becomes "repair"
+  if (d.type === "service") { d.type = "repair"; changed = true; }
+  // ensure fields exist
+  if (d.reportTitle === undefined) {
+    // auto-name diagnostics from concern, repairs from first work entry
+    if (d.type === "diagnostic") d.reportTitle = (d.concern || "").trim();
+    else if (d.type === "repair")
+      d.reportTitle = ((d.workLog && d.workLog[0] && d.workLog[0].title) || "").trim();
+    else d.reportTitle = "";
+    changed = true;
+  }
+  // work entries get a subcontractor field
+  (d.workLog || []).forEach((w) => {
+    if (w.sub === undefined) { w.sub = ""; changed = true; }
+    if (w.invoicePhotos === undefined) { w.invoicePhotos = []; changed = true; }
+  });
+  // action items get an approval recommendation type
+  (d.sections || []).forEach((s) =>
+    (s.items || []).forEach((it) => {
+      if (it.approvalKind === undefined) { it.approvalKind = "repair"; changed = true; }
+    })
+  );
+  if (d.migratedV2 === undefined) { d.migratedV2 = true; changed = true; }
+  return d;
 }
 
 /* ============================================================ */
@@ -396,6 +498,12 @@ function App() {
   async function persist(snapshot) {
     if (!snapshot) return;
     setSaveState((s) => ({ status: "saving", at: s.at }));
+    if ((snapshot.type || "monthly") === "monthly" && snapshot.stock) {
+      await sSet(
+        "stock:" + snapshot.vesselId,
+        snapshot.stock.map((s) => ({ id: s.id, cat: s.cat, name: s.name, low: false }))
+      );
+    }
     const ok = await sSet("insp:" + snapshot.id, snapshot);
     if (!ok) {
       setSaveState({ status: "error", at: new Date() });
@@ -407,6 +515,7 @@ function App() {
       id: snapshot.id,
       type: snapshot.type || "monthly",
       label: snapshot.label,
+      name: reportName(snapshot),
       dateISO: snapshot.dateISO,
       verdict: v,
       action,
@@ -460,17 +569,35 @@ function App() {
       }
     }
     const fresh = buildInspection(activeVessel.id, type, template);
+    if (type === "monthly") {
+      let stockTpl = await sGet("stock:" + activeVessel.id);
+      if (!stockTpl) {
+        stockTpl = [];
+        Object.entries(DEFAULT_STOCK).forEach(([cat, items]) =>
+          items.forEach((n) =>
+            stockTpl.push({ id: uid(), cat, name: n, low: false })
+          )
+        );
+      }
+      fresh.stock = stockTpl.map((s) => ({
+        id: uid(),
+        cat: s.cat,
+        name: s.name,
+        low: false,
+      }));
+    }
     setSaveState({ status: "idle", at: null });
     setInsp(fresh);
     setScreen("inspect");
   }
 
   async function openInspection(id, target) {
-    const data = await sGet("insp:" + id);
+    let data = await sGet("insp:" + id);
     if (!data) {
       setToast("Could not load that report.");
       return;
     }
+    data = migrateInspection(data);
     await hydratePhotos(data);
     setSaveState({ status: "saved", at: new Date() });
     setInsp(data);
@@ -544,8 +671,9 @@ function App() {
   async function openDossier() {
     const all = [];
     for (const e of index) {
-      const d = await sGet("insp:" + e.id);
+      let d = await sGet("insp:" + e.id);
       if (d) {
+        d = migrateInspection(d);
         await hydratePhotos(d);
         all.push(d);
       }
@@ -963,8 +1091,11 @@ function VesselsScreen({ vessels, saveVessels, openVessel, openBackup }) {
     name: "",
     owner: "",
     make: "",
-    location: "",
+    location: "Bradenton",
     plan: "Management Plan",
+    hin: "",
+    genSerial: "",
+    engines: [{ id: uid(), label: "", serial: "" }],
   });
 
   function submit() {
@@ -975,10 +1106,31 @@ function VesselsScreen({ vessels, saveVessels, openVessel, openBackup }) {
       name: "",
       owner: "",
       make: "",
-      location: "",
+      location: "Bradenton",
       plan: "Management Plan",
+      hin: "",
+      genSerial: "",
+      engines: [{ id: uid(), label: "", serial: "" }],
     });
     setAdding(false);
+  }
+  function patchEngine(eid, patch) {
+    setForm((f) => ({
+      ...f,
+      engines: f.engines.map((e) => (e.id === eid ? { ...e, ...patch } : e)),
+    }));
+  }
+  function addEngine() {
+    setForm((f) => ({
+      ...f,
+      engines: [...f.engines, { id: uid(), label: "", serial: "" }],
+    }));
+  }
+  function removeEngine(eid) {
+    setForm((f) => ({
+      ...f,
+      engines: f.engines.filter((e) => e.id !== eid),
+    }));
   }
 
   return (
@@ -1022,8 +1174,6 @@ function VesselsScreen({ vessels, saveVessels, openVessel, openBackup }) {
               ["name", "Vessel name *", "e.g. Top Shelf"],
               ["owner", "Owner / client", "e.g. Brian R."],
               ["make", "Make / model / year", "e.g. 2022 Twin Vee 280 GFX"],
-              ["location", "Location / slip", "e.g. Cortez, lift kept"],
-              ["plan", "Plan tier", "Management Plan"],
             ].map(([k, label, ph]) => (
               <div key={k} style={{ marginBottom: 10 }}>
                 <FieldLabel>{label}</FieldLabel>
@@ -1035,6 +1185,74 @@ function VesselsScreen({ vessels, saveVessels, openVessel, openBackup }) {
                 />
               </div>
             ))}
+            <div style={{ marginBottom: 10 }}>
+              <FieldLabel>Location</FieldLabel>
+              <select
+                value={form.location}
+                onChange={(e) => setForm({ ...form, location: e.target.value })}
+                style={inputStyle()}
+              >
+                <option value="Bradenton">Bradenton</option>
+                <option value="Sarasota">Sarasota</option>
+              </select>
+            </div>
+            <div style={{ marginBottom: 10 }}>
+              <FieldLabel>HIN (hull ID number)</FieldLabel>
+              <input
+                value={form.hin}
+                onChange={(e) => setForm({ ...form, hin: e.target.value })}
+                placeholder="e.g. BWCE1234J920"
+                style={inputStyle()}
+              />
+            </div>
+            <div style={{ marginBottom: 10 }}>
+              <FieldLabel>Engines / serial numbers</FieldLabel>
+              {form.engines.map((eng, i) => (
+                <div key={eng.id} style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+                  <input
+                    value={eng.label}
+                    onChange={(e) => patchEngine(eng.id, { label: e.target.value })}
+                    placeholder={"Pos (e.g. Port)"}
+                    style={{ ...inputStyle(), flex: "0 0 38%" }}
+                  />
+                  <input
+                    value={eng.serial}
+                    onChange={(e) => patchEngine(eng.id, { serial: e.target.value })}
+                    placeholder="Serial #"
+                    style={{ ...inputStyle(), flex: 1 }}
+                  />
+                  {form.engines.length > 1 && (
+                    <button
+                      onClick={() => removeEngine(eng.id)}
+                      style={{ ...smallBtn(), color: C.action, borderColor: C.action }}
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+              ))}
+              <button onClick={addEngine} style={{ ...smallBtn(), width: "100%" }}>
+                + Add engine
+              </button>
+            </div>
+            <div style={{ marginBottom: 10 }}>
+              <FieldLabel>Generator serial (optional)</FieldLabel>
+              <input
+                value={form.genSerial}
+                onChange={(e) => setForm({ ...form, genSerial: e.target.value })}
+                placeholder="Generator serial #"
+                style={inputStyle()}
+              />
+            </div>
+            <div style={{ marginBottom: 10 }}>
+              <FieldLabel>Plan tier</FieldLabel>
+              <input
+                value={form.plan}
+                onChange={(e) => setForm({ ...form, plan: e.target.value })}
+                placeholder="Management Plan"
+                style={inputStyle()}
+              />
+            </div>
             <PrimaryBtn onClick={submit} style={{ width: "100%" }}>
               Save vessel
             </PrimaryBtn>
@@ -1444,7 +1662,7 @@ function VesselScreen({
               }}
             >
               <div style={{ flex: 1, minWidth: 140 }}>
-                <div style={{ fontWeight: 800 }}>{e.label}</div>
+                <div style={{ fontWeight: 800 }}>{e.name || e.label}</div>
                 <div style={{ fontSize: 12, color: C.mute }}>
                   {dateLabel(e.dateISO)} · {tm.label}
                 </div>
@@ -1646,10 +1864,40 @@ function InspectScreen({
           <input
             value={insp.engineHours}
             onChange={(e) => setInsp({ ...insp, engineHours: e.target.value })}
-            placeholder="e.g. 412.6"
+            placeholder="e.g. 412.6 — or P420 / S421 for multiple"
+            style={inputStyle()}
+          />
+          <div style={{ height: 12 }} />
+          <FieldLabel>Generator hours (optional)</FieldLabel>
+          <input
+            value={insp.generatorHours || ""}
+            onChange={(e) => setInsp({ ...insp, generatorHours: e.target.value })}
+            placeholder="e.g. 34.4"
             inputMode="decimal"
             style={inputStyle()}
           />
+          {(type === "diagnostic" || type === "repair") && (
+            <React.Fragment>
+              <div style={{ height: 12 }} />
+              <FieldLabel>
+                {type === "diagnostic"
+                  ? "Diagnostic title (names the report)"
+                  : "Repair title (names the report)"}
+              </FieldLabel>
+              <input
+                value={insp.reportTitle || ""}
+                onChange={(e) =>
+                  setInsp({ ...insp, reportTitle: e.target.value })
+                }
+                placeholder={
+                  type === "diagnostic"
+                    ? "e.g. Livewell breaker"
+                    : "e.g. Spark plugs"
+                }
+                style={inputStyle()}
+              />
+            </React.Fragment>
+          )}
         </div>
 
         {type === "diagnostic" && (
@@ -1686,6 +1934,10 @@ function InspectScreen({
               setToast={setToast}
             />
           ))}
+
+        {type === "monthly" && (
+          <StockSection insp={insp} setInsp={setInsp} />
+        )}
 
         <WorkLog
           insp={insp}
@@ -2066,6 +2318,38 @@ function ChecklistItem({ item, onPatch, onRemoveItem, setToast }) {
             onFiles={(e) => addPhotosFromInput(e, onPatch, setToast)}
             addLabel={"+ Photo"}
           />
+          {item.status === "action" && (
+            <div style={{ marginTop: 10 }}>
+              <FieldLabel>Approval needed for</FieldLabel>
+              <div style={{ display: "flex", gap: 6 }}>
+                {[
+                  ["repair", "Approve repair"],
+                  ["diagnosis", "Approve diagnosis"],
+                ].map(([k, lbl]) => {
+                  const on = (item.approvalKind || "repair") === k;
+                  return (
+                    <button
+                      key={k}
+                      onClick={() => onPatch({ approvalKind: k })}
+                      style={{
+                        flex: 1,
+                        border:
+                          "1.5px solid " + (on ? C.action : C.line),
+                        background: on ? C.action : "transparent",
+                        color: on ? "#fff" : C.mute,
+                        borderRadius: 6,
+                        padding: "8px 6px",
+                        fontSize: 12,
+                        fontWeight: 700,
+                      }}
+                    >
+                      {lbl}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
           <button
             onClick={onRemoveItem}
             style={{
@@ -2200,6 +2484,214 @@ function WorkLog({ insp, setInsp, setToast, title }) {
   );
 }
 
+const STOCK_CATS = [
+  ["engine", "Engine stock"],
+  ["generator", "Generator stock"],
+  ["boat", "Boat stock"],
+];
+function StockSection({ insp, setInsp }) {
+  const [open, setOpen] = useState(false);
+  const stock = insp.stock || [];
+  const [newName, setNewName] = useState({ engine: "", generator: "", boat: "" });
+  function toggleLow(id) {
+    setInsp((prev) => ({
+      ...prev,
+      stock: (prev.stock || []).map((s) =>
+        s.id === id ? { ...s, low: !s.low } : s
+      ),
+    }));
+  }
+  function addItem(cat) {
+    const n = (newName[cat] || "").trim();
+    if (!n) return;
+    setInsp((prev) => ({
+      ...prev,
+      stock: [...(prev.stock || []), { id: uid(), cat, name: n, low: false }],
+    }));
+    setNewName((s) => ({ ...s, [cat]: "" }));
+  }
+  function removeItem(id) {
+    setInsp((prev) => ({
+      ...prev,
+      stock: (prev.stock || []).filter((s) => s.id !== id),
+    }));
+  }
+  const lowCount = stock.filter((s) => s.low).length;
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <button
+        onClick={() => setOpen(!open)}
+        style={{
+          width: "100%",
+          textAlign: "left",
+          background: C.inkSoft,
+          color: "#fff",
+          border: "none",
+          borderRadius: open ? "10px 10px 0 0" : 10,
+          padding: "12px 14px",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+        }}
+      >
+        <span
+          style={{
+            fontWeight: 800,
+            letterSpacing: "0.04em",
+            textTransform: "uppercase",
+            fontSize: 13,
+          }}
+        >
+          Boat Stock
+        </span>
+        <span
+          style={{
+            fontFamily: "ui-monospace, Menlo, monospace",
+            fontSize: 12,
+            opacity: 0.85,
+          }}
+        >
+          {lowCount > 0 ? lowCount + " low" : "ok"} {open ? "\u25be" : "\u25b8"}
+        </span>
+      </button>
+      {open && (
+        <div
+          style={{
+            background: C.card,
+            border: "1px solid " + C.line,
+            borderTop: "none",
+            borderRadius: "0 0 10px 10px",
+            padding: 14,
+          }}
+        >
+          <div style={{ fontSize: 12.5, color: C.mute, marginBottom: 12 }}>
+            Tap an item to flag it LOW. Only flagged items print on the report as
+            "to restock." Your list is remembered per boat.
+          </div>
+          {STOCK_CATS.map(([cat, label]) => {
+            const items = stock.filter((s) => s.cat === cat);
+            return (
+              <div key={cat} style={{ marginBottom: 14 }}>
+                <FieldLabel>{label}</FieldLabel>
+                <div
+                  style={{
+                    display: "flex",
+                    flexWrap: "wrap",
+                    gap: 6,
+                    marginBottom: 8,
+                  }}
+                >
+                  {items.map((s) => (
+                    <span
+                      key={s.id}
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                        border:
+                          "1.5px solid " + (s.low ? C.action : C.line),
+                        background: s.low ? C.action : "transparent",
+                        color: s.low ? "#fff" : C.ink,
+                        borderRadius: 16,
+                        padding: "5px 10px",
+                        fontSize: 12,
+                        fontWeight: 600,
+                      }}
+                    >
+                      <span onClick={() => toggleLow(s.id)} style={{ cursor: "pointer" }}>
+                        {s.name}
+                        {s.low ? " \u00b7 LOW" : ""}
+                      </span>
+                      <span
+                        onClick={() => removeItem(s.id)}
+                        style={{
+                          cursor: "pointer",
+                          opacity: 0.6,
+                          fontWeight: 800,
+                        }}
+                      >
+                        &times;
+                      </span>
+                    </span>
+                  ))}
+                </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <input
+                    value={newName[cat]}
+                    onChange={(e) =>
+                      setNewName((s) => ({ ...s, [cat]: e.target.value }))
+                    }
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") addItem(cat);
+                    }}
+                    placeholder={"Add " + label.toLowerCase() + " item\u2026"}
+                    style={{ ...inputStyle(), flex: 1, fontSize: 13 }}
+                  />
+                  <button onClick={() => addItem(cat)} style={smallBtn(true)}>
+                    Add
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SubPicker({ value, onChange }) {
+  const [subs, setSubs] = useState([]);
+  const [typing, setTyping] = useState(false);
+  useEffect(() => {
+    getSubs().then(setSubs);
+  }, []);
+  const isKnown = value === "" || value === "Self" || subs.includes(value);
+  return (
+    <div style={{ marginTop: 8 }}>
+      <FieldLabel>Performed by</FieldLabel>
+      {!typing && isKnown ? (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <select
+            value={value === "" ? "Self" : value}
+            onChange={(e) => {
+              if (e.target.value === "__new__") {
+                setTyping(true);
+                onChange("");
+              } else {
+                onChange(e.target.value);
+              }
+            }}
+            style={{ ...inputStyle(), flex: 1, fontSize: 13 }}
+          >
+            <option value="Self">Self (Coastal Marine Pro)</option>
+            {subs.map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
+            ))}
+            <option value="__new__">+ New subcontractor…</option>
+          </select>
+        </div>
+      ) : (
+        <div style={{ display: "flex", gap: 6 }}>
+          <input
+            autoFocus
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            onBlur={() => {
+              if (value.trim()) rememberSub(value.trim());
+              setTyping(false);
+            }}
+            placeholder="Subcontractor name"
+            style={{ ...inputStyle(), flex: 1, fontSize: 13 }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function WorkEntry({ entry, onPatch, onRemove, setToast }) {
   const fileRef = useRef(null);
 
@@ -2241,6 +2733,10 @@ function WorkEntry({ entry, onPatch, onRemove, setToast }) {
         placeholder="Parts / materials used (optional)"
         style={{ ...inputStyle(), fontSize: 13, marginTop: 8 }}
       />
+      <SubPicker
+        value={entry.sub || ""}
+        onChange={(v) => onPatch({ sub: v })}
+      />
       <PhotoStrip
         photos={entry.photos}
         onRemove={(pid) => {
@@ -2254,7 +2750,38 @@ function WorkEntry({ entry, onPatch, onRemove, setToast }) {
         onFiles={(e) => addPhotosFromInput(e, onPatch, setToast)}
         addLabel={"+ Before / After"}
       />
+      <InvoicePhotoStrip entry={entry} onPatch={onPatch} setToast={setToast} />
     </div>
+  );
+}
+
+function InvoicePhotoStrip({ entry, onPatch, setToast }) {
+  const fileRef = useRef(null);
+  const photos = entry.invoicePhotos || [];
+  return (
+    <PhotoStrip
+      photos={photos}
+      onRemove={(pid) => {
+        onPatch((prev) => ({
+          invoicePhotos: (prev.invoicePhotos || []).filter((x) => x.id !== pid),
+        }));
+        delPhoto(pid);
+      }}
+      onAddClick={() => fileRef.current && fileRef.current.click()}
+      fileRef={fileRef}
+      onFiles={(e) =>
+        addPhotosFromInput(
+          e,
+          (fn) =>
+            onPatch((prev) => {
+              const res = fn(prev.invoicePhotos ? { photos: prev.invoicePhotos } : { photos: [] });
+              return { invoicePhotos: res.photos };
+            }),
+          setToast
+        )
+      }
+      addLabel={"+ Sub invoice"}
+    />
   );
 }
 
@@ -2296,26 +2823,27 @@ function ReportScreen({ vessel, insp, back }) {
           blurb: "Testing, findings, and recommended repair documented below.",
         };
 
-  const findings = [];
+  const goodList = [];
+  const monitorList = [];
+  const actionList = [];
   (insp.sections || []).forEach((s) =>
     s.items.forEach((it) => {
-      if (
-        it.status === "action" ||
-        it.status === "monitor" ||
-        (it.note && it.status) ||
-        it.photos.length > 0
-      ) {
-        if (it.status && it.status !== "na")
-          findings.push({ ...it, section: s.name });
-      }
+      if (it.status === "good") goodList.push({ ...it, section: s.name });
+      else if (it.status === "monitor")
+        monitorList.push({ ...it, section: s.name });
+      else if (it.status === "action")
+        actionList.push({ ...it, section: s.name });
     })
   );
-  findings.sort(
-    (a, b) =>
-      (a.status === "action" ? -1 : 1) - (b.status === "action" ? -1 : 1)
-  );
+  const byCritical = (a, b) =>
+    criticalRank(a.section + " " + a.name) -
+    criticalRank(b.section + " " + b.name);
+  goodList.sort(byCritical);
+  monitorList.sort(byCritical);
+  actionList.sort(byCritical);
 
   const workEntries = (insp.workLog || []).filter((w) => w.title.trim());
+  const flaggedStock = (insp.stock || []).filter((s) => s.low);
 
   return (
     <div style={{ background: "#E9E6DE", minHeight: "100vh" }}>
@@ -2392,7 +2920,9 @@ function ReportScreen({ vessel, insp, back }) {
               </div>
             </div>
             <div style={{ textAlign: "right" }}>
-              <div style={{ fontWeight: 800, fontSize: 16 }}>{insp.label}</div>
+              <div style={{ fontWeight: 800, fontSize: 16 }}>
+                {reportName(insp)}
+              </div>
               <div style={{ fontSize: 12, opacity: 0.75 }}>
                 Service date: {dateLabel(insp.dateISO)}
               </div>
@@ -2410,10 +2940,14 @@ function ReportScreen({ vessel, insp, back }) {
         >
           {[
             ["Vessel", vessel.name],
-            ["Owner", vessel.owner || "—"],
-            ["Make / Model", vessel.make || "—"],
-            ["Location", vessel.location || "—"],
+            ["Owner", vessel.owner || "\u2014"],
+            ["Make / Model", vessel.make || "\u2014"],
+            ["Location", vessel.location || "\u2014"],
+            ...(vessel.hin ? [["HIN", vessel.hin]] : []),
             ...(insp.engineHours ? [["Engine hours", insp.engineHours]] : []),
+            ...(insp.generatorHours
+              ? [["Generator hours", insp.generatorHours]]
+              : []),
           ].map(([k, v]) => (
             <div
               key={k}
@@ -2576,6 +3110,11 @@ function ReportScreen({ vessel, insp, back }) {
                       Parts: {w.parts}
                     </div>
                   )}
+                  {w.sub && w.sub !== "Self" && (
+                    <div style={{ fontSize: 12, color: C.brassDark, marginTop: 4, fontWeight: 700 }}>
+                      Performed by: {w.sub}
+                    </div>
+                  )}
                   {w.photos.length > 0 && (
                     <div
                       style={{
@@ -2632,138 +3171,134 @@ function ReportScreen({ vessel, insp, back }) {
             </ReportBlock>
           )}
 
-          {/* Monthly findings */}
-          {type === "monthly" && findings.length > 0 && (
-            <ReportBlock title="Findings & documentation">
-              {findings.map((f) => (
-                <div
-                  key={f.id}
-                  className="report-item"
-                  style={{
-                    borderLeft: "4px solid " + STATUS[f.status].color,
-                    background: "#FAF9F6",
-                    borderRadius: "0 8px 8px 0",
-                    padding: "12px 14px",
-                    marginBottom: 12,
-                  }}
-                >
+          {/* GOOD TO GO */}
+          {type === "monthly" && goodList.length > 0 && (
+            <ReportBlock title="Good to go">
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+                  gap: "4px 18px",
+                }}
+              >
+                {goodList.map((f) => (
                   <div
+                    key={f.id}
                     style={{
                       display: "flex",
-                      justifyContent: "space-between",
-                      gap: 10,
-                      flexWrap: "wrap",
+                      alignItems: "flex-start",
+                      gap: 8,
+                      fontSize: 13,
+                      padding: "3px 0",
                     }}
                   >
-                    <div style={{ fontWeight: 800, fontSize: 14 }}>{f.name}</div>
-                    <div
-                      style={{
-                        fontFamily: "ui-monospace, Menlo, monospace",
-                        fontSize: 10,
-                        fontWeight: 700,
-                        letterSpacing: "0.1em",
-                        color: STATUS[f.status].color,
-                      }}
-                    >
-                      {f.section.toUpperCase()} · {STATUS[f.status].short}
-                    </div>
+                    <span style={{ color: C.good, fontWeight: 900, lineHeight: 1.4 }}>
+                      &#10003;
+                    </span>
+                    <span style={{ lineHeight: 1.4 }}>
+                      {f.name}
+                      {f.note ? (
+                        <span style={{ color: C.mute }}> &mdash; {f.note}</span>
+                      ) : null}
+                    </span>
                   </div>
-                  {f.note && (
-                    <div
-                      style={{
-                        fontSize: 13,
-                        lineHeight: 1.55,
-                        marginTop: 6,
-                        whiteSpace: "pre-wrap",
-                      }}
-                    >
-                      {f.note}
-                    </div>
-                  )}
-                  {f.photos.length > 0 && (
-                    <div
-                      style={{
-                        display: "flex",
-                        gap: 8,
-                        marginTop: 10,
-                        flexWrap: "wrap",
-                      }}
-                    >
-                      {f.photos.map((p) => {
-                        const src = photoSrc(p);
-                        if (!src) return null;
-                        return (
-                          <img
-                            key={p.id}
-                            src={src}
-                            alt=""
-                            className="report-photo"
-                            style={{
-                              width: 150,
-                              height: 112,
-                              objectFit: "cover",
-                              borderRadius: 6,
-                              border: "1px solid " + C.line,
-                            }}
-                          />
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              ))}
+                ))}
+              </div>
             </ReportBlock>
           )}
 
-          {/* Monthly checklist */}
-          {type === "monthly" && (
-            <ReportBlock title="Inspection checklist">
-              {insp.sections.map((s) => {
-                const checked = s.items.filter((i) => i.status);
-                if (!checked.length) return null;
-                return (
-                  <div key={s.name} style={{ marginBottom: 14 }}>
+          {/* FINDINGS: monitor then action, problem + photos + recommendation */}
+          {type === "monthly" &&
+            (monitorList.length > 0 || actionList.length > 0) && (
+              <ReportBlock title="Findings & documentation">
+                {[...monitorList, ...actionList].map((f) => (
+                  <div
+                    key={f.id}
+                    className="report-item"
+                    style={{
+                      borderLeft: "4px solid " + STATUS[f.status].color,
+                      background: "#FAF9F6",
+                      borderRadius: "0 8px 8px 0",
+                      padding: "12px 14px",
+                      marginBottom: 12,
+                    }}
+                  >
                     <div
                       style={{
-                        fontFamily: "ui-monospace, Menlo, monospace",
-                        fontSize: 11,
-                        fontWeight: 700,
-                        letterSpacing: "0.1em",
-                        color: C.mute,
-                        textTransform: "uppercase",
-                        marginBottom: 4,
+                        display: "flex",
+                        justifyContent: "space-between",
+                        gap: 10,
+                        flexWrap: "wrap",
                       }}
                     >
-                      {s.name}
-                    </div>
-                    {checked.map((it) => (
+                      <div style={{ fontWeight: 800, fontSize: 14 }}>{f.name}</div>
                       <div
-                        key={it.id}
                         style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          gap: 10,
-                          padding: "4px 0",
-                          borderBottom: "1px dotted " + C.line,
-                          fontSize: 13,
+                          fontFamily: "ui-monospace, Menlo, monospace",
+                          fontSize: 10,
+                          fontWeight: 700,
+                          letterSpacing: "0.1em",
+                          color: STATUS[f.status].color,
                         }}
                       >
-                        <span>{it.name}</span>
-                        <span
-                          style={{
-                            fontFamily: "ui-monospace, Menlo, monospace",
-                            fontSize: 11,
-                            fontWeight: 700,
-                            color: STATUS[it.status].color,
-                          }}
-                        >
-                          {STATUS[it.status].short}
-                        </span>
+                        {f.section.toUpperCase()} &middot; {STATUS[f.status].short}
                       </div>
-                    ))}
+                    </div>
+                    {f.note && (
+                      <div
+                        style={{
+                          fontSize: 13,
+                          lineHeight: 1.55,
+                          marginTop: 6,
+                          whiteSpace: "pre-wrap",
+                        }}
+                      >
+                        {f.note}
+                      </div>
+                    )}
+                    {f.photos.length > 0 && (
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: 8,
+                          marginTop: 10,
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        {f.photos.map((p) => {
+                          const src = photoSrc(p);
+                          if (!src) return null;
+                          return (
+                            <img
+                              key={p.id}
+                              src={src}
+                              alt=""
+                              className="report-photo"
+                              style={{
+                                width: 150,
+                                height: 112,
+                                objectFit: "cover",
+                                borderRadius: 6,
+                                border: "1px solid " + C.line,
+                              }}
+                            />
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
-                );
-              })}
+                ))}
+              </ReportBlock>
+            )}
+
+          {/* Boat stock to restock (only flagged) */}
+          {type === "monthly" && flaggedStock.length > 0 && (
+            <ReportBlock title="Stock to restock">
+              <div style={{ fontSize: 13, lineHeight: 1.7 }}>
+                {flaggedStock.map((s) => (
+                  <div key={s.id}>&bull; {s.name}</div>
+                ))}
+              </div>
             </ReportBlock>
           )}
 
@@ -2784,6 +3319,62 @@ function ReportScreen({ vessel, insp, back }) {
               >
                 {insp.recommendations}
               </p>
+            </ReportBlock>
+          )}
+
+          {/* APPROVALS (auto from action items) */}
+          {actionList.length > 0 && (
+            <ReportBlock title="Approvals">
+              <div
+                style={{
+                  fontSize: 12.5,
+                  color: C.inkSoft,
+                  marginBottom: 12,
+                  lineHeight: 1.5,
+                }}
+              >
+                The items below were found during service and are documented for
+                your records. Each notes our recommended next step.
+              </div>
+              {actionList.map((f) => (
+                <div
+                  key={"appr-" + f.id}
+                  className="report-item"
+                  style={{
+                    border: "1px solid " + C.line,
+                    borderLeft: "4px solid " + C.action,
+                    borderRadius: "0 8px 8px 0",
+                    padding: "12px 14px",
+                    marginBottom: 10,
+                  }}
+                >
+                  <div
+                    style={{
+                      fontFamily: "ui-monospace, Menlo, monospace",
+                      fontSize: 10,
+                      fontWeight: 700,
+                      letterSpacing: "0.1em",
+                      color: C.action,
+                      marginBottom: 4,
+                    }}
+                  >
+                    {f.section.toUpperCase()}
+                  </div>
+                  <div style={{ fontWeight: 800, fontSize: 14, marginBottom: 6 }}>
+                    {f.name}
+                  </div>
+                  <div style={{ fontSize: 13, lineHeight: 1.5 }}>
+                    <span style={{ fontWeight: 700 }}>Found: </span>
+                    {f.note || "See findings above."}
+                  </div>
+                  <div style={{ fontSize: 13, lineHeight: 1.5, marginTop: 3 }}>
+                    <span style={{ fontWeight: 700 }}>Recommend: </span>
+                    {(f.approvalKind || "repair") === "diagnosis"
+                      ? "Approve diagnostic time to scope this item."
+                      : "Approve repair to correct this item."}
+                  </div>
+                </div>
+              ))}
             </ReportBlock>
           )}
 
@@ -3047,7 +3638,7 @@ function DossierScreen({ vessel, reports, back }) {
                     return (
                       <tr key={r.id} style={{ borderTop: "1px solid " + C.line }}>
                         <td style={{ padding: "8px 8px 8px 0", fontWeight: 700 }}>
-                          {r.label}
+                          {reportName(r)}
                         </td>
                         <td style={{ padding: "8px" }}>{dateLabel(r.dateISO)}</td>
                         <td style={{ padding: "8px" }}>{tmm.label}</td>
@@ -3205,7 +3796,7 @@ function DossierScreen({ vessel, reports, back }) {
                       marginBottom: 4,
                     }}
                   >
-                    {r.label} · {TYPE_META[r.type || "monthly"].label}
+                    {reportName(r)}
                   </div>
                   {finds.length === 0 ? (
                     <div style={{ fontSize: 13, color: C.good, fontWeight: 600 }}>
