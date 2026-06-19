@@ -804,6 +804,12 @@ function App() {
           deleteInspection={deleteInspection}
           deleteVessel={deleteVessel}
           openDossier={openDossier}
+          saveVessel={async (updated) => {
+            const next = vessels.map((x) => (x.id === updated.id ? updated : x));
+            setVessels(next);
+            setActiveVessel(updated);
+            await sSet("vessels", next);
+          }}
         />
       )}
       {screen === "tasks" && activeVessel && (
@@ -1494,6 +1500,273 @@ function BackupScreen({ back, setToast, reloadVessels }) {
 }
 
 /* ====================== vessel screen ====================== */
+function CopyRow({ label, value }) {
+  const [copied, setCopied] = useState(false);
+  if (!value) return null;
+  function copy() {
+    const done = () => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(value).then(done, () => {
+        promptFallback(value);
+      });
+    } else {
+      promptFallback(value);
+    }
+  }
+  function promptFallback(v) {
+    window.prompt("Copy this value:", v);
+  }
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "9px 0",
+        borderBottom: "1px dotted " + C.line,
+      }}
+    >
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div
+          style={{
+            fontFamily: "ui-monospace, Menlo, monospace",
+            fontSize: 10,
+            letterSpacing: "0.1em",
+            color: C.mute,
+            textTransform: "uppercase",
+          }}
+        >
+          {label}
+        </div>
+        <div
+          style={{
+            fontFamily: "ui-monospace, Menlo, monospace",
+            fontSize: 14,
+            fontWeight: 700,
+            wordBreak: "break-all",
+          }}
+        >
+          {value}
+        </div>
+      </div>
+      <button
+        onClick={copy}
+        style={{
+          ...smallBtn(),
+          flex: "0 0 auto",
+          background: copied ? C.good : "transparent",
+          color: copied ? "#fff" : C.ink,
+          borderColor: copied ? C.good : C.line,
+        }}
+      >
+        {copied ? "Copied" : "Copy"}
+      </button>
+    </div>
+  );
+}
+
+function VesselProfilePanel({ vessel, saveVessel }) {
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState(vessel);
+  useEffect(() => {
+    setForm(vessel);
+  }, [vessel]);
+
+  const engines = vessel.engines || [];
+  const hasData =
+    vessel.hin ||
+    vessel.genSerial ||
+    engines.some((e) => e.serial);
+
+  function patchEngine(eid, patch) {
+    setForm((f) => ({
+      ...f,
+      engines: (f.engines || []).map((e) =>
+        e.id === eid ? { ...e, ...patch } : e
+      ),
+    }));
+  }
+  function addEngine() {
+    setForm((f) => ({
+      ...f,
+      engines: [...(f.engines || []), { id: uid(), label: "", serial: "" }],
+    }));
+  }
+  function removeEngine(eid) {
+    setForm((f) => ({
+      ...f,
+      engines: (f.engines || []).filter((e) => e.id !== eid),
+    }));
+  }
+  async function save() {
+    await saveVessel(form);
+    setEditing(false);
+  }
+
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <button
+        onClick={() => setOpen(!open)}
+        style={{
+          width: "100%",
+          textAlign: "left",
+          background: "transparent",
+          border: "1px solid " + C.line,
+          borderLeft: "5px solid " + C.brass,
+          borderRadius: 10,
+          padding: "12px 14px",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+        }}
+      >
+        <span
+          style={{
+            fontWeight: 800,
+            letterSpacing: "0.04em",
+            textTransform: "uppercase",
+            fontSize: 13,
+            color: C.ink,
+          }}
+        >
+          Vessel info &amp; serial numbers
+        </span>
+        <span
+          style={{
+            fontFamily: "ui-monospace, Menlo, monospace",
+            fontSize: 12,
+            color: C.mute,
+          }}
+        >
+          {open ? "\u25be" : "\u25b8"}
+        </span>
+      </button>
+      {open && (
+        <div
+          style={{
+            background: C.card,
+            border: "1px solid " + C.line,
+            borderTop: "none",
+            borderRadius: "0 0 10px 10px",
+            padding: 14,
+          }}
+        >
+          {!editing ? (
+            <React.Fragment>
+              {!hasData && (
+                <div style={{ fontSize: 13, color: C.mute, marginBottom: 10 }}>
+                  No serial numbers saved yet. Tap Edit to add HIN and engine
+                  serials.
+                </div>
+              )}
+              <CopyRow label="HIN (hull ID)" value={vessel.hin} />
+              {engines.map((e, i) => (
+                <CopyRow
+                  key={e.id}
+                  label={
+                    "Engine" + (e.label ? " - " + e.label : " " + (i + 1)) + " serial"
+                  }
+                  value={e.serial}
+                />
+              ))}
+              <CopyRow label="Generator serial" value={vessel.genSerial} />
+              <button
+                onClick={() => {
+                  setForm(vessel);
+                  setEditing(true);
+                }}
+                style={{ ...smallBtn(), width: "100%", marginTop: 12 }}
+              >
+                Edit vessel info
+              </button>
+            </React.Fragment>
+          ) : (
+            <React.Fragment>
+              <div style={{ marginBottom: 10 }}>
+                <FieldLabel>HIN (hull ID number)</FieldLabel>
+                <input
+                  value={form.hin || ""}
+                  onChange={(e) => setForm({ ...form, hin: e.target.value })}
+                  placeholder="e.g. BWCE1234J920"
+                  style={inputStyle()}
+                />
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <FieldLabel>Engines / serial numbers</FieldLabel>
+                {(form.engines || []).map((eng, i) => (
+                  <div
+                    key={eng.id}
+                    style={{ display: "flex", gap: 6, marginBottom: 6 }}
+                  >
+                    <input
+                      value={eng.label}
+                      onChange={(e) =>
+                        patchEngine(eng.id, { label: e.target.value })
+                      }
+                      placeholder="Pos"
+                      style={{ ...inputStyle(), flex: "0 0 34%" }}
+                    />
+                    <input
+                      value={eng.serial}
+                      onChange={(e) =>
+                        patchEngine(eng.id, { serial: e.target.value })
+                      }
+                      placeholder="Serial #"
+                      style={{ ...inputStyle(), flex: 1 }}
+                    />
+                    <button
+                      onClick={() => removeEngine(eng.id)}
+                      style={{
+                        ...smallBtn(),
+                        color: C.action,
+                        borderColor: C.action,
+                      }}
+                    >
+                      &times;
+                    </button>
+                  </div>
+                ))}
+                <button onClick={addEngine} style={{ ...smallBtn(), width: "100%" }}>
+                  + Add engine
+                </button>
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <FieldLabel>Generator serial</FieldLabel>
+                <input
+                  value={form.genSerial || ""}
+                  onChange={(e) =>
+                    setForm({ ...form, genSerial: e.target.value })
+                  }
+                  placeholder="Generator serial #"
+                  style={inputStyle()}
+                />
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => {
+                    setForm(vessel);
+                    setEditing(false);
+                  }}
+                  style={{ ...smallBtn(), flex: 1 }}
+                >
+                  Cancel
+                </button>
+                <PrimaryBtn onClick={save} style={{ flex: 1 }}>
+                  Save
+                </PrimaryBtn>
+              </div>
+            </React.Fragment>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function VesselScreen({
   vessel,
   index,
@@ -1505,6 +1778,7 @@ function VesselScreen({
   deleteInspection,
   deleteVessel,
   openDossier,
+  saveVessel,
 }) {
   const VERDICT = {
     ready: { t: "Vessel Ready", c: C.good },
@@ -1532,6 +1806,8 @@ function VesselScreen({
               .join(" · ")}
           </div>
         </div>
+
+        <VesselProfilePanel vessel={vessel} saveVessel={saveVessel} />
 
         <div style={{ display: "grid", gap: 8 }}>
           <PrimaryBtn
