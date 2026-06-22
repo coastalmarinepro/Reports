@@ -604,6 +604,36 @@ function App() {
     setScreen(target);
   }
 
+  async function duplicateInspection(id) {
+    let data = await sGet("insp:" + id);
+    if (!data) {
+      setToast("Could not load that report.");
+      return;
+    }
+    data = migrateInspection(data);
+    await hydratePhotos(data);
+    // deep clone, new id, copy photos to new ids so they're independent
+    const clone = JSON.parse(JSON.stringify(data));
+    clone.id = uid();
+    async function cloneList(arr) {
+      for (const ph of arr || []) {
+        const nid = await copyPhoto(ph.id);
+        if (nid) ph.id = nid;
+      }
+    }
+    for (const s of clone.sections || [])
+      for (const it of s.items || []) await cloneList(it.photos);
+    for (const w of clone.workLog || []) {
+      await cloneList(w.photos);
+      await cloneList(w.invoicePhotos);
+    }
+    // keep same date/title so user just tweaks; mark as fresh editable
+    setSaveState({ status: "idle", at: null });
+    setInsp(clone);
+    setScreen("inspect");
+    setToast("Duplicated. Change the date and details for this entry.");
+  }
+
   async function deleteInspection(id) {
     const data = await sGet("insp:" + id);
     if (data) {
@@ -802,6 +832,7 @@ function App() {
           startInspection={startInspection}
           openInspection={openInspection}
           deleteInspection={deleteInspection}
+          duplicateInspection={duplicateInspection}
           deleteVessel={deleteVessel}
           openDossier={openDossier}
           saveVessel={async (updated) => {
@@ -1500,6 +1531,32 @@ function BackupScreen({ back, setToast, reloadVessels }) {
 }
 
 /* ====================== vessel screen ====================== */
+function InfoRow({ label, value }) {
+  return (
+    <div
+      style={{
+        padding: "9px 0",
+        borderBottom: "1px dotted " + C.line,
+      }}
+    >
+      <div
+        style={{
+          fontFamily: "ui-monospace, Menlo, monospace",
+          fontSize: 10,
+          letterSpacing: "0.1em",
+          color: C.mute,
+          textTransform: "uppercase",
+        }}
+      >
+        {label}
+      </div>
+      <div style={{ fontSize: 14, fontWeight: 700, marginTop: 2 }}>
+        {value || "\u2014"}
+      </div>
+    </div>
+  );
+}
+
 function CopyRow({ label, value }) {
   const [copied, setCopied] = useState(false);
   if (!value) return null;
@@ -1657,12 +1714,10 @@ function VesselProfilePanel({ vessel, saveVessel }) {
         >
           {!editing ? (
             <React.Fragment>
-              {!hasData && (
-                <div style={{ fontSize: 13, color: C.mute, marginBottom: 10 }}>
-                  No serial numbers saved yet. Tap Edit to add HIN and engine
-                  serials.
-                </div>
-              )}
+              <InfoRow label="Owner / client" value={vessel.owner} />
+              <InfoRow label="Make / model / year" value={vessel.make} />
+              <InfoRow label="Location" value={vessel.location} />
+              <InfoRow label="Plan tier" value={vessel.plan} />
               <CopyRow label="HIN (hull ID)" value={vessel.hin} />
               {engines.map((e, i) => (
                 <CopyRow
@@ -1686,6 +1741,55 @@ function VesselProfilePanel({ vessel, saveVessel }) {
             </React.Fragment>
           ) : (
             <React.Fragment>
+              <div style={{ marginBottom: 10 }}>
+                <FieldLabel>Vessel name</FieldLabel>
+                <input
+                  value={form.name || ""}
+                  onChange={(e) => setForm({ ...form, name: e.target.value })}
+                  placeholder="Vessel name"
+                  style={inputStyle()}
+                />
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <FieldLabel>Owner / client</FieldLabel>
+                <input
+                  value={form.owner || ""}
+                  onChange={(e) => setForm({ ...form, owner: e.target.value })}
+                  placeholder="e.g. Brian R."
+                  style={inputStyle()}
+                />
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <FieldLabel>Make / model / year</FieldLabel>
+                <input
+                  value={form.make || ""}
+                  onChange={(e) => setForm({ ...form, make: e.target.value })}
+                  placeholder="e.g. 2022 Twin Vee 280 GFX"
+                  style={inputStyle()}
+                />
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <FieldLabel>Location</FieldLabel>
+                <select
+                  value={form.location || "Bradenton"}
+                  onChange={(e) =>
+                    setForm({ ...form, location: e.target.value })
+                  }
+                  style={inputStyle()}
+                >
+                  <option value="Bradenton">Bradenton</option>
+                  <option value="Sarasota">Sarasota</option>
+                </select>
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <FieldLabel>Plan tier</FieldLabel>
+                <input
+                  value={form.plan || ""}
+                  onChange={(e) => setForm({ ...form, plan: e.target.value })}
+                  placeholder="Management Plan"
+                  style={inputStyle()}
+                />
+              </div>
               <div style={{ marginBottom: 10 }}>
                 <FieldLabel>HIN (hull ID number)</FieldLabel>
                 <input
@@ -1776,6 +1880,7 @@ function VesselScreen({
   startInspection,
   openInspection,
   deleteInspection,
+  duplicateInspection,
   deleteVessel,
   openDossier,
   saveVessel,
@@ -1972,6 +2077,13 @@ function VesselScreen({
                   View
                 </button>
                 <button
+                  onClick={() => duplicateInspection(e.id)}
+                  style={smallBtn()}
+                  title="Duplicate for fast back-entry"
+                >
+                  Copy
+                </button>
+                <button
                   onClick={() => {
                     if (confirm("Delete this report permanently?"))
                       deleteInspection(e.id);
@@ -2136,6 +2248,26 @@ function InspectScreen({
             marginBottom: 16,
           }}
         >
+          <FieldLabel>Service date</FieldLabel>
+          <input
+            type="date"
+            value={(insp.dateISO || "").slice(0, 10)}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (!v) return;
+              const d = new Date(v + "T12:00:00");
+              setInsp({
+                ...insp,
+                dateISO: d.toISOString(),
+                label: monthLabel(d),
+              });
+            }}
+            style={inputStyle()}
+          />
+          <div style={{ fontSize: 11, color: C.mute, marginTop: 5 }}>
+            Set this to the real date of service when entering past history.
+          </div>
+          <div style={{ height: 12 }} />
           <FieldLabel>Engine hours (optional)</FieldLabel>
           <input
             value={insp.engineHours}
@@ -3700,7 +3832,7 @@ function ReportScreen({ vessel, insp, back }) {
                 {insp.preparedBy}
               </div>
               <div style={{ fontSize: 12, color: C.mute }}>
-                Mobile marine service · Bradenton / Sarasota / Parrish
+                Mobile marine service · Bradenton / Sarasota / St. Pete
               </div>
             </div>
             <div
@@ -3754,6 +3886,30 @@ function DossierScreen({ vessel, reports, back }) {
       .filter((w) => w.title.trim())
       .map((w) => ({ ...w, when: r.label, dateISO: r.dateISO }))
   );
+  // Categorize every documented work item by system for the summary.
+  const SYSTEMS = [
+    ["Engines & drive", ["engine", "motor", "prop", "oil", "fuel", "cooling", "lower unit", "outboard", "gear"]],
+    ["Generator", ["generator", "genset", "gen "]],
+    ["Steering & controls", ["steering", "helm", "throttle", "control", "trim"]],
+    ["Electrical & batteries", ["battery", "batteries", "electrical", "wiring", "breaker", "charger", "alternator", "fuse", "voltage"]],
+    ["Bilge & pumps", ["bilge", "pump", "livewell", "washdown"]],
+    ["Hull & through-hulls", ["hull", "through-hull", "seacock", "anode", "zinc", "bottom", "gelcoat", "strainer", "clamp", "hose"]],
+    ["Onboard systems", ["ac", "air condition", "seakeeper", "windlass", "fresh water", "freshwater", "head", "waste"]],
+    ["Electronics & nav", ["electronics", "nav", "screen", "display", "antenna", "radar", "gps"]],
+  ];
+  function systemOf(text) {
+    const t = (text || "").toLowerCase();
+    for (const [name, kws] of SYSTEMS) {
+      if (kws.some((k) => t.indexOf(k) !== -1)) return name;
+    }
+    return "Other";
+  }
+  const systemCounts = {};
+  allWork.forEach((w) => {
+    const s = systemOf(w.title + " " + (w.detail || ""));
+    systemCounts[s] = (systemCounts[s] || 0) + 1;
+  });
+  const systemRows = Object.entries(systemCounts).sort((a, b) => b[1] - a[1]);
   const VERDICT = {
     ready: ["READY", C.good],
     monitor: ["MONITOR", C.monitor],
@@ -3825,6 +3981,19 @@ function DossierScreen({ vessel, reports, back }) {
           <div style={{ fontSize: 14, opacity: 0.85, marginTop: 4 }}>
             {[vessel.make, vessel.location].filter(Boolean).join(" · ")}
           </div>
+          {vessel.hin && (
+            <div
+              style={{
+                fontFamily: "ui-monospace, Menlo, monospace",
+                fontSize: 12,
+                opacity: 0.8,
+                marginTop: 6,
+                letterSpacing: "0.08em",
+              }}
+            >
+              HIN {vessel.hin}
+            </div>
+          )}
           <div style={{ display: "flex", gap: 26, marginTop: 22, flexWrap: "wrap" }}>
             {[
               ["Reports on file", reports.length],
@@ -3865,19 +4034,89 @@ function DossierScreen({ vessel, reports, back }) {
         </div>
 
         <div style={{ padding: "26px 30px" }}>
+          {/* Attestation */}
           <div
             style={{
-              fontSize: 13.5,
-              lineHeight: 1.65,
-              color: C.inkSoft,
+              border: "2px solid " + C.ink,
+              borderRadius: 8,
+              padding: "18px 20px",
               marginBottom: 24,
             }}
           >
-            This vessel has been maintained under the Coastal Marine Pro
-            management program. Every visit below is documented with
-            inspection, photographs, and a log of all work performed. Records
-            are presented in chronological order.
+            <div
+              style={{
+                fontFamily: "ui-monospace, Menlo, monospace",
+                fontSize: 10,
+                letterSpacing: "0.14em",
+                color: C.brassDark,
+                textTransform: "uppercase",
+                marginBottom: 8,
+              }}
+            >
+              Statement of documented service
+            </div>
+            <div style={{ fontSize: 13.5, lineHeight: 1.7, color: C.inkSoft }}>
+              This document represents the service and maintenance history on
+              record for {vessel.name}
+              {vessel.hin ? " (HIN " + vessel.hin + ")" : ""} as serviced and
+              coordinated by Coastal Marine Pro between{" "}
+              {dateLabel(first.dateISO)} and {dateLabel(last.dateISO)}. It
+              comprises {reports.length}{" "}
+              {reports.length === 1 ? "report" : "reports"} and{" "}
+              {allWork.length} documented service{" "}
+              {allWork.length === 1 ? "item" : "items"} across the vessel's
+              systems, presented in chronological order. Records are maintained
+              as the work is performed to support the vessel's condition,
+              reliability, and resale value.
+            </div>
+            <div
+              style={{
+                marginTop: 14,
+                paddingTop: 12,
+                borderTop: "1px solid " + C.line,
+                fontSize: 13,
+              }}
+            >
+              <div style={{ fontWeight: 800 }}>Cory — Coastal Marine Pro</div>
+              <div style={{ color: C.mute }}>
+                Mobile marine service · Bradenton / Sarasota / St. Pete
+              </div>
+            </div>
           </div>
+
+          {/* Maintenance summary by system */}
+          {systemRows.length > 0 && (
+            <ReportBlock title="Maintenance summary by system">
+              <div style={{ fontSize: 12.5, color: C.mute, marginBottom: 10 }}>
+                Documented service items grouped by vessel system over the
+                coverage period.
+              </div>
+              {systemRows.map(([name, count]) => (
+                <div
+                  key={name}
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    padding: "8px 0",
+                    borderBottom: "1px dotted " + C.line,
+                  }}
+                >
+                  <span style={{ fontSize: 13.5, fontWeight: 600 }}>{name}</span>
+                  <span
+                    style={{
+                      fontFamily: "ui-monospace, Menlo, monospace",
+                      fontSize: 13,
+                      fontWeight: 700,
+                      color: C.brassDark,
+                    }}
+                  >
+                    {count} {count === 1 ? "item" : "items"}
+                  </span>
+                </div>
+              ))}
+            </ReportBlock>
+          )}
 
           {/* Timeline */}
           <ReportBlock title="Service timeline">
@@ -4130,7 +4369,7 @@ function DossierScreen({ vessel, reports, back }) {
                 Coastal Marine Pro
               </div>
               <div style={{ fontSize: 12, color: C.mute }}>
-                Mobile marine service · Bradenton / Sarasota / Parrish
+                Mobile marine service · Bradenton / Sarasota / St. Pete
               </div>
             </div>
             <div
