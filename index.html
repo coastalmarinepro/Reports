@@ -3886,30 +3886,6 @@ function DossierScreen({ vessel, reports, back }) {
       .filter((w) => w.title.trim())
       .map((w) => ({ ...w, when: r.label, dateISO: r.dateISO }))
   );
-  // Categorize every documented work item by system for the summary.
-  const SYSTEMS = [
-    ["Engines & drive", ["engine", "motor", "prop", "oil", "fuel", "cooling", "lower unit", "outboard", "gear"]],
-    ["Generator", ["generator", "genset", "gen "]],
-    ["Steering & controls", ["steering", "helm", "throttle", "control", "trim"]],
-    ["Electrical & batteries", ["battery", "batteries", "electrical", "wiring", "breaker", "charger", "alternator", "fuse", "voltage"]],
-    ["Bilge & pumps", ["bilge", "pump", "livewell", "washdown"]],
-    ["Hull & through-hulls", ["hull", "through-hull", "seacock", "anode", "zinc", "bottom", "gelcoat", "strainer", "clamp", "hose"]],
-    ["Onboard systems", ["ac", "air condition", "seakeeper", "windlass", "fresh water", "freshwater", "head", "waste"]],
-    ["Electronics & nav", ["electronics", "nav", "screen", "display", "antenna", "radar", "gps"]],
-  ];
-  function systemOf(text) {
-    const t = (text || "").toLowerCase();
-    for (const [name, kws] of SYSTEMS) {
-      if (kws.some((k) => t.indexOf(k) !== -1)) return name;
-    }
-    return "Other";
-  }
-  const systemCounts = {};
-  allWork.forEach((w) => {
-    const s = systemOf(w.title + " " + (w.detail || ""));
-    systemCounts[s] = (systemCounts[s] || 0) + 1;
-  });
-  const systemRows = Object.entries(systemCounts).sort((a, b) => b[1] - a[1]);
   const VERDICT = {
     ready: ["READY", C.good],
     monitor: ["MONITOR", C.monitor],
@@ -3992,6 +3968,26 @@ function DossierScreen({ vessel, reports, back }) {
               }}
             >
               HIN {vessel.hin}
+            </div>
+          )}
+          {((vessel.engines || []).some((e) => e.serial) || vessel.genSerial) && (
+            <div
+              style={{
+                fontFamily: "ui-monospace, Menlo, monospace",
+                fontSize: 11,
+                opacity: 0.7,
+                marginTop: 6,
+                lineHeight: 1.6,
+              }}
+            >
+              {(vessel.engines || [])
+                .filter((e) => e.serial)
+                .map((e, i) => (
+                  <div key={e.id}>
+                    {(e.label || "Engine " + (i + 1)) + " S/N: " + e.serial}
+                  </div>
+                ))}
+              {vessel.genSerial && <div>Generator S/N: {vessel.genSerial}</div>}
             </div>
           )}
           <div style={{ display: "flex", gap: 26, marginTop: 22, flexWrap: "wrap" }}>
@@ -4084,40 +4080,6 @@ function DossierScreen({ vessel, reports, back }) {
             </div>
           </div>
 
-          {/* Maintenance summary by system */}
-          {systemRows.length > 0 && (
-            <ReportBlock title="Maintenance summary by system">
-              <div style={{ fontSize: 12.5, color: C.mute, marginBottom: 10 }}>
-                Documented service items grouped by vessel system over the
-                coverage period.
-              </div>
-              {systemRows.map(([name, count]) => (
-                <div
-                  key={name}
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    padding: "8px 0",
-                    borderBottom: "1px dotted " + C.line,
-                  }}
-                >
-                  <span style={{ fontSize: 13.5, fontWeight: 600 }}>{name}</span>
-                  <span
-                    style={{
-                      fontFamily: "ui-monospace, Menlo, monospace",
-                      fontSize: 13,
-                      fontWeight: 700,
-                      color: C.brassDark,
-                    }}
-                  >
-                    {count} {count === 1 ? "item" : "items"}
-                  </span>
-                </div>
-              ))}
-            </ReportBlock>
-          )}
-
           {/* Timeline */}
           <ReportBlock title="Service timeline">
             <div style={{ overflowX: "auto" }}>
@@ -4188,164 +4150,231 @@ function DossierScreen({ vessel, reports, back }) {
             </div>
           </ReportBlock>
 
-          {/* Complete repair record */}
-          {allWork.length > 0 && (
-            <ReportBlock title="Complete repair & maintenance record">
-              {allWork.map((w) => (
+          {/* Detailed service records: each visit as a formal dated record */}
+          <ReportBlock title="Detailed service records">
+            <div style={{ fontSize: 12.5, color: C.mute, marginBottom: 14 }}>
+              Each documented visit in full, in chronological order. Hours shown
+              are as recorded at the time of service.
+            </div>
+            {reports.map((r) => {
+              const work = (r.workLog || []).filter((w) => w.title.trim());
+              const finds = [];
+              (r.sections || []).forEach((s) =>
+                s.items.forEach((it) => {
+                  if (it.status === "action" || it.status === "monitor")
+                    finds.push({ ...it, section: s.name });
+                })
+              );
+              const tmm = TYPE_META[r.type || "monthly"];
+              return (
                 <div
-                  key={w.id}
+                  key={r.id}
                   className="report-item"
                   style={{
-                    borderLeft: "4px solid " + C.brassDark,
-                    background: "#FAF9F6",
-                    borderRadius: "0 8px 8px 0",
-                    padding: "12px 14px",
-                    marginBottom: 12,
+                    border: "1px solid " + C.line,
+                    borderRadius: 8,
+                    padding: "14px 16px",
+                    marginBottom: 16,
                   }}
                 >
                   <div
                     style={{
                       display: "flex",
                       justifyContent: "space-between",
+                      alignItems: "flex-start",
                       gap: 10,
                       flexWrap: "wrap",
+                      borderBottom: "2px solid " + C.ink,
+                      paddingBottom: 8,
+                      marginBottom: 10,
                     }}
                   >
-                    <div style={{ fontWeight: 800, fontSize: 14 }}>{w.title}</div>
+                    <div>
+                      <div style={{ fontWeight: 900, fontSize: 15 }}>
+                        {reportName(r)}
+                      </div>
+                      <div style={{ fontSize: 12, color: C.mute, marginTop: 2 }}>
+                        {dateLabel(r.dateISO)}
+                        {r.engineHours ? " \u00b7 Engine hrs: " + r.engineHours : ""}
+                        {r.generatorHours
+                          ? " \u00b7 Gen hrs: " + r.generatorHours
+                          : ""}
+                      </div>
+                    </div>
                     <div
                       style={{
                         fontFamily: "ui-monospace, Menlo, monospace",
                         fontSize: 10,
-                        color: C.brassDark,
+                        fontWeight: 700,
                         letterSpacing: "0.1em",
+                        color: tmm.color,
+                        border: "1.5px solid " + tmm.color,
+                        borderRadius: 5,
+                        padding: "3px 8px",
+                        textTransform: "uppercase",
                       }}
                     >
-                      {w.when.toUpperCase()}
+                      {tmm.label}
                     </div>
                   </div>
-                  {w.detail && (
+
+                  {r.type === "diagnostic" && r.concern && (
+                    <div style={{ fontSize: 13, marginBottom: 8 }}>
+                      <span style={{ fontWeight: 700 }}>Reported concern: </span>
+                      {r.concern}
+                    </div>
+                  )}
+
+                  {r.summary && (
                     <div
                       style={{
                         fontSize: 13,
                         lineHeight: 1.55,
-                        marginTop: 6,
+                        marginBottom: 10,
                         whiteSpace: "pre-wrap",
                       }}
                     >
-                      {w.detail}
+                      {r.summary}
                     </div>
                   )}
-                  {w.parts && (
-                    <div style={{ fontSize: 12, color: C.mute, marginTop: 4 }}>
-                      Parts: {w.parts}
-                    </div>
-                  )}
-                  {w.photos.length > 0 && (
+
+                  {work.map((w) => (
                     <div
+                      key={w.id}
                       style={{
-                        display: "flex",
-                        gap: 8,
-                        marginTop: 10,
-                        flexWrap: "wrap",
+                        borderLeft: "3px solid " + C.brassDark,
+                        paddingLeft: 12,
+                        marginBottom: 10,
                       }}
                     >
-                      {w.photos.map((p) => {
-                        const src = photoSrc(p);
-                        if (!src) return null;
-                        return (
-                          <img
-                            key={p.id}
-                            src={src}
-                            alt=""
-                            className="report-photo"
-                            style={{
-                              width: 150,
-                              height: 112,
-                              objectFit: "cover",
-                              borderRadius: 6,
-                              border: "1px solid " + C.line,
-                            }}
-                          />
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </ReportBlock>
-          )}
-
-          {/* Findings per visit */}
-          <ReportBlock title="Inspection findings by visit">
-            {reports.map((r) => {
-              const finds = [];
-              (r.sections || []).forEach((s) =>
-                s.items.forEach((it) => {
-                  if (
-                    it.status === "action" ||
-                    it.status === "monitor" ||
-                    (it.note && it.status)
-                  ) {
-                    finds.push({ ...it, section: s.name });
-                  }
-                })
-              );
-              if (r.type === "diagnostic" && r.diagnosis) {
-                finds.push({
-                  id: r.id + "-diag",
-                  status: "action",
-                  name: "Diagnosis",
-                  note: r.diagnosis,
-                });
-              }
-              return (
-                <div key={r.id} style={{ marginBottom: 16 }}>
-                  <div
-                    style={{
-                      fontFamily: "ui-monospace, Menlo, monospace",
-                      fontSize: 11,
-                      fontWeight: 700,
-                      letterSpacing: "0.1em",
-                      color: C.mute,
-                      textTransform: "uppercase",
-                      marginBottom: 4,
-                    }}
-                  >
-                    {reportName(r)}
-                  </div>
-                  {finds.length === 0 ? (
-                    <div style={{ fontSize: 13, color: C.good, fontWeight: 600 }}>
-                      All inspected systems in good condition.
-                    </div>
-                  ) : (
-                    finds.map((f) => (
-                      <div
-                        key={f.id}
-                        style={{
-                          display: "flex",
-                          gap: 10,
-                          padding: "5px 0",
-                          borderBottom: "1px dotted " + C.line,
-                          fontSize: 13,
-                        }}
-                      >
-                        <span
+                      <div style={{ fontWeight: 800, fontSize: 13.5 }}>
+                        {w.title}
+                      </div>
+                      {w.detail && (
+                        <div
                           style={{
-                            fontFamily: "ui-monospace, Menlo, monospace",
-                            fontSize: 11,
-                            fontWeight: 700,
-                            color: STATUS[f.status].color,
-                            minWidth: 62,
+                            fontSize: 13,
+                            lineHeight: 1.5,
+                            marginTop: 3,
+                            whiteSpace: "pre-wrap",
                           }}
                         >
-                          {STATUS[f.status].short}
-                        </span>
-                        <span>
-                          <strong>{f.name}</strong>
-                          {f.note ? " : " + f.note : ""}
-                        </span>
+                          {w.detail}
+                        </div>
+                      )}
+                      {w.parts && (
+                        <div
+                          style={{ fontSize: 12, color: C.mute, marginTop: 3 }}
+                        >
+                          Parts: {w.parts}
+                        </div>
+                      )}
+                      {w.sub && w.sub !== "Self" && (
+                        <div
+                          style={{
+                            fontSize: 12,
+                            color: C.brassDark,
+                            marginTop: 3,
+                            fontWeight: 700,
+                          }}
+                        >
+                          Performed by: {w.sub}
+                        </div>
+                      )}
+                      {w.photos && w.photos.length > 0 && (
+                        <div
+                          style={{
+                            display: "flex",
+                            gap: 8,
+                            marginTop: 8,
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          {w.photos.map((ph) => {
+                            const src = photoSrc(ph);
+                            if (!src) return null;
+                            return (
+                              <img
+                                key={ph.id}
+                                src={src}
+                                alt=""
+                                className="report-photo"
+                                style={{
+                                  width: 140,
+                                  height: 105,
+                                  objectFit: "cover",
+                                  borderRadius: 6,
+                                  border: "1px solid " + C.line,
+                                }}
+                              />
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+
+                  {r.type === "diagnostic" && r.diagnosis && (
+                    <div style={{ fontSize: 13, marginTop: 6 }}>
+                      <span style={{ fontWeight: 700 }}>Diagnosis: </span>
+                      {r.diagnosis}
+                    </div>
+                  )}
+                  {r.recommendations && (
+                    <div style={{ fontSize: 13, marginTop: 6 }}>
+                      <span style={{ fontWeight: 700 }}>
+                        {r.type === "diagnostic"
+                          ? "Recommended repair: "
+                          : "Recommendations: "}
+                      </span>
+                      {r.recommendations}
+                    </div>
+                  )}
+
+                  {finds.length > 0 && (
+                    <div style={{ marginTop: 10 }}>
+                      <div
+                        style={{
+                          fontFamily: "ui-monospace, Menlo, monospace",
+                          fontSize: 10,
+                          fontWeight: 700,
+                          letterSpacing: "0.1em",
+                          color: C.mute,
+                          textTransform: "uppercase",
+                          marginBottom: 4,
+                        }}
+                      >
+                        Items noted
                       </div>
-                    ))
+                      {finds.map((f) => (
+                        <div
+                          key={f.id}
+                          style={{
+                            display: "flex",
+                            gap: 10,
+                            padding: "4px 0",
+                            borderBottom: "1px dotted " + C.line,
+                            fontSize: 13,
+                          }}
+                        >
+                          <span
+                            style={{
+                              fontFamily: "ui-monospace, Menlo, monospace",
+                              fontSize: 11,
+                              fontWeight: 700,
+                              color: STATUS[f.status].color,
+                              minWidth: 62,
+                            }}
+                          >
+                            {STATUS[f.status].short}
+                          </span>
+                          <span>
+                            <strong>{f.name}</strong>
+                            {f.note ? " : " + f.note : ""}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
                   )}
                 </div>
               );
