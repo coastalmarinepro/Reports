@@ -11,6 +11,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
 <style>
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: #F7F6F2; }
@@ -256,6 +257,14 @@ async function sKeys() {
 /* ---------- photo persistence ---------- */
 const photoCache = {}; // id -> dataUrl for this session
 let subListCache = null;
+// Annotation bridge: App registers an opener; photo flows call requestAnnotation.
+let _annotateOpener = null;
+function registerAnnotator(fn) { _annotateOpener = fn; }
+function requestAnnotation(dataUrl) {
+  // returns a Promise that resolves to the final (possibly annotated) dataUrl
+  if (!_annotateOpener) return Promise.resolve(dataUrl);
+  return new Promise((resolve) => _annotateOpener(dataUrl, resolve));
+}
 async function getSubs() {
   if (subListCache) return subListCache;
   subListCache = (await sGet("subs")) || [];
@@ -398,11 +407,16 @@ function verdictOf(insp) {
 function reportName(insp) {
   const t = insp.type || "monthly";
   if (t === "monthly") return insp.label + " Checklist";
-  const title = (insp.reportTitle || "").trim();
+  // ignore a title that just repeats the report type word
+  let title = (insp.reportTitle || "").trim();
+  if (/^(diagnostic|repair|service)$/i.test(title)) title = "";
+  const firstConcern = (insp.concern || "").split("\n")[0].trim();
+  const firstWork =
+    (insp.workLog || []).find((w) => (w.title || "").trim()) || {};
   if (t === "diagnostic")
-    return "Diagnostic: " + (title || insp.concern || "Untitled");
+    return "Diagnostic: " + (title || firstConcern || "Service");
   if (t === "service" || t === "repair")
-    return "Repair: " + (title || (insp.workLog && insp.workLog[0] && insp.workLog[0].title) || "Untitled");
+    return "Repair: " + (title || (firstWork.title || "").trim() || "Service");
   return insp.label;
 }
 
@@ -448,6 +462,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState("");
   const [saveState, setSaveState] = useState({ status: "idle", at: null });
+  const [anno, setAnno] = useState(null); // { src, resolve }
   const saveTimer = useRef(null);
   const tasksTimer = useRef(null);
   const indexRef = useRef(index);
@@ -466,6 +481,7 @@ function App() {
       setVessels(v || []);
       setLoading(false);
     })();
+    registerAnnotator((src, resolve) => setAnno({ src, resolve }));
   }, []);
 
   useEffect(() => {
@@ -881,6 +897,7 @@ function App() {
         <ReportScreen
           vessel={activeVessel}
           insp={insp}
+          setToast={setToast}
           back={() => setScreen("inspect")}
         />
       )}
@@ -888,11 +905,314 @@ function App() {
         <DossierScreen
           vessel={activeVessel}
           reports={dossier}
+          setToast={setToast}
           back={() => setScreen("vessel")}
         />
       )}
       {toast && <Toast text={toast} />}
+      {anno && (
+        <PhotoAnnotator
+          src={anno.src}
+          onDone={(finalUrl) => {
+            anno.resolve(finalUrl);
+            setAnno(null);
+          }}
+        />
+      )}
     </Shell>
+  );
+}
+
+/* ====================== pdf export ====================== */
+async function exportPDF(elId, filename, setToast) {
+  const el = document.getElementById(elId);
+  if (!el || !window.html2pdf) {
+    if (setToast) setToast("PDF tool not ready. Use Print as a backup.");
+    return;
+  }
+  if (setToast) setToast("Building PDF\u2026");
+  const opt = {
+    margin: 0,
+    filename: filename + ".pdf",
+    image: { type: "jpeg", quality: 0.92 },
+    html2canvas: { scale: 2, useCORS: true, backgroundColor: "#ffffff" },
+    jsPDF: { unit: "pt", format: "letter", orientation: "portrait" },
+    pagebreak: { mode: ["css", "legacy"], avoid: ".report-item" },
+  };
+  try {
+    await window.html2pdf().set(opt).from(el).save();
+    if (setToast) setToast("PDF saved. Check your downloads or share sheet.");
+  } catch (e) {
+    if (setToast) setToast("PDF failed. Use Print as a backup.");
+  }
+}
+
+/* ====================== photo annotator ====================== */
+function PhotoAnnotator({ src, onDone }) {
+  const imgWrapRef = useRef(null);
+  const imgRef = useRef(null);
+  const [marks, setMarks] = useState([]); // {id,type:'circle'|'label',x,y,size,text}
+  const [size, setSize] = useState("large"); // small | large
+  const [mode, setMode] = useState("circle"); // circle | label
+  const [natural, setNatural] = useState({ w: 0, h: 0 });
+  const [busy, setBusy] = useState(false);
+
+  function onImgLoad() {
+    const im = imgRef.current;
+    if (im) setNatural({ w: im.naturalWidth, h: im.naturalHeight });
+  }
+
+  function place(e) {
+    const wrap = imgWrapRef.current;
+    if (!wrap) return;
+    const rect = wrap.getBoundingClientRect();
+    const pt = e.touches && e.touches[0] ? e.touches[0] : e;
+    const x = (pt.clientX - rect.left) / rect.width;
+    const y = (pt.clientY - rect.top) / rect.height;
+    if (x < 0 || x > 1 || y < 0 || y > 1) return;
+    if (mode === "circle") {
+      setMarks((m) => [
+        ...m,
+        { id: uid(), type: "circle", x, y, size },
+      ]);
+    } else {
+      const text = window.prompt("Label text:", "");
+      if (text && text.trim()) {
+        setMarks((m) => [
+          ...m,
+          { id: uid(), type: "label", x, y, text: text.trim() },
+        ]);
+      }
+    }
+  }
+
+  function undo() {
+    setMarks((m) => m.slice(0, -1));
+  }
+  function clearAll() {
+    setMarks([]);
+  }
+
+  async function bakeAndDone() {
+    setBusy(true);
+    try {
+      const im = imgRef.current;
+      const W = natural.w || im.naturalWidth;
+      const H = natural.h || im.naturalHeight;
+      const canvas = document.createElement("canvas");
+      canvas.width = W;
+      canvas.height = H;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(im, 0, 0, W, H);
+      const base = Math.min(W, H);
+      const stroke = Math.max(4, base * 0.012);
+      ctx.strokeStyle = "#E0531F";
+      ctx.fillStyle = "#E0531F";
+      ctx.lineWidth = stroke;
+      marks.forEach((mk) => {
+        if (mk.type === "circle") {
+          const r = (mk.size === "small" ? 0.09 : 0.16) * base;
+          ctx.beginPath();
+          ctx.arc(mk.x * W, mk.y * H, r, 0, Math.PI * 2);
+          ctx.stroke();
+        } else {
+          const fs = Math.max(22, base * 0.045);
+          ctx.font = "700 " + fs + "px Archivo, system-ui, sans-serif";
+          ctx.textBaseline = "middle";
+          const tw = ctx.measureText(mk.text).width;
+          let tx = mk.x * W;
+          if (tx + tw > W) tx = W - tw - 6;
+          if (tx < 6) tx = 6;
+          // subtle dark backing for legibility
+          ctx.save();
+          ctx.fillStyle = "rgba(0,0,0,0.35)";
+          ctx.fillRect(tx - 6, mk.y * H - fs * 0.75, tw + 12, fs * 1.5);
+          ctx.fillStyle = "#FF6A2B";
+          ctx.fillText(mk.text, tx, mk.y * H);
+          ctx.restore();
+        }
+      });
+      const out = canvas.toDataURL("image/jpeg", 0.72);
+      onDone(out);
+    } catch (err) {
+      onDone(src); // fall back to unannotated on any failure
+    }
+  }
+
+  const btn = (active) => ({
+    flex: 1,
+    padding: "11px 8px",
+    borderRadius: 8,
+    border: "1.5px solid " + (active ? C.brass : "rgba(255,255,255,0.3)"),
+    background: active ? C.brass : "transparent",
+    color: "#fff",
+    fontWeight: 800,
+    fontSize: 13,
+  });
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 200,
+        background: "#0A1620",
+        display: "flex",
+        flexDirection: "column",
+      }}
+    >
+      <div
+        style={{
+          padding: "12px 16px",
+          color: "#fff",
+          fontWeight: 800,
+          fontSize: 14,
+          letterSpacing: "0.04em",
+          textTransform: "uppercase",
+          borderBottom: "1px solid rgba(255,255,255,0.15)",
+        }}
+      >
+        Mark up photo
+      </div>
+
+      <div
+        style={{
+          flex: 1,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          overflow: "hidden",
+          padding: 10,
+        }}
+      >
+        <div
+          ref={imgWrapRef}
+          onClick={place}
+          style={{
+            position: "relative",
+            maxWidth: "100%",
+            maxHeight: "100%",
+            lineHeight: 0,
+            touchAction: "manipulation",
+          }}
+        >
+          <img
+            ref={imgRef}
+            src={src}
+            alt=""
+            onLoad={onImgLoad}
+            style={{
+              maxWidth: "100%",
+              maxHeight: "70vh",
+              display: "block",
+              userSelect: "none",
+            }}
+          />
+          {marks.map((mk) =>
+            mk.type === "circle" ? (
+              <div
+                key={mk.id}
+                style={{
+                  position: "absolute",
+                  left: mk.x * 100 + "%",
+                  top: mk.y * 100 + "%",
+                  width: (mk.size === "small" ? 18 : 32) + "%",
+                  paddingBottom: (mk.size === "small" ? 18 : 32) + "%",
+                  transform: "translate(-50%, -50%)",
+                  border: "3px solid #E0531F",
+                  borderRadius: "50%",
+                  pointerEvents: "none",
+                }}
+              />
+            ) : (
+              <div
+                key={mk.id}
+                style={{
+                  position: "absolute",
+                  left: mk.x * 100 + "%",
+                  top: mk.y * 100 + "%",
+                  transform: "translate(0, -50%)",
+                  color: "#FF6A2B",
+                  fontWeight: 800,
+                  fontSize: "clamp(14px, 4vw, 26px)",
+                  background: "rgba(0,0,0,0.35)",
+                  padding: "1px 6px",
+                  borderRadius: 4,
+                  whiteSpace: "nowrap",
+                  pointerEvents: "none",
+                }}
+              >
+                {mk.text}
+              </div>
+            )
+          )}
+        </div>
+      </div>
+
+      <div style={{ padding: "12px 16px", paddingBottom: 22 }}>
+        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+          <button onClick={() => setMode("circle")} style={btn(mode === "circle")}>
+            Circle
+          </button>
+          <button onClick={() => setMode("label")} style={btn(mode === "label")}>
+            Label
+          </button>
+        </div>
+        {mode === "circle" && (
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <button onClick={() => setSize("small")} style={btn(size === "small")}>
+              Small
+            </button>
+            <button onClick={() => setSize("large")} style={btn(size === "large")}>
+              Large
+            </button>
+          </div>
+        )}
+        <div
+          style={{
+            color: "rgba(255,255,255,0.6)",
+            fontSize: 12,
+            textAlign: "center",
+            marginBottom: 10,
+          }}
+        >
+          Tap the photo to drop a {mode === "circle" ? "circle" : "label"}.
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            onClick={undo}
+            disabled={marks.length === 0}
+            style={{
+              ...btn(false),
+              opacity: marks.length === 0 ? 0.4 : 1,
+            }}
+          >
+            Undo
+          </button>
+          <button onClick={clearAll} style={btn(false)}>
+            Clear
+          </button>
+          <button
+            onClick={bakeAndDone}
+            disabled={busy}
+            style={{
+              flex: 2,
+              padding: "11px 8px",
+              borderRadius: 8,
+              border: "none",
+              background: C.good,
+              color: "#fff",
+              fontWeight: 800,
+              fontSize: 14,
+              textTransform: "uppercase",
+              letterSpacing: "0.04em",
+            }}
+          >
+            {busy ? "Saving…" : marks.length ? "Save photo" : "Use as-is"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -2554,9 +2874,10 @@ async function addPhotosFromInput(e, onPatch, setToast) {
   e.target.value = "";
   for (const f of files) {
     try {
-      const dataUrl = await compressImage(f);
+      const raw = await compressImage(f);
+      const finalUrl = await requestAnnotation(raw);
       const id = uid();
-      const ok = await savePhoto(id, dataUrl);
+      const ok = await savePhoto(id, finalUrl);
       if (!ok) {
         setToast("Photo save failed: " + (lastError || "unknown error"));
         continue;
@@ -3194,7 +3515,7 @@ function InvoicePhotoStrip({ entry, onPatch, setToast }) {
 }
 
 /* ====================== report screen ====================== */
-function ReportScreen({ vessel, insp, back }) {
+function ReportScreen({ vessel, insp, back, setToast }) {
   const stats = verdictOf(insp);
   const type = insp.type || "monthly";
   const tm = TYPE_META[type];
@@ -3259,24 +3580,41 @@ function ReportScreen({ vessel, insp, back }) {
         sub="Client report preview"
         onBack={back}
         right={
-          <button
-            onClick={() => window.print()}
-            style={{
-              background: C.brass,
-              color: "#fff",
-              border: "none",
-              borderRadius: 6,
-              padding: "8px 14px",
-              fontSize: 13,
-              fontWeight: 800,
-              textTransform: "uppercase",
-            }}
-          >
-            Print / PDF
-          </button>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button
+              onClick={() => exportPDF("cmp-report-page", reportName(insp), setToast)}
+              style={{
+                background: C.brass,
+                color: "#fff",
+                border: "none",
+                borderRadius: 6,
+                padding: "8px 14px",
+                fontSize: 13,
+                fontWeight: 800,
+                textTransform: "uppercase",
+              }}
+            >
+              Save PDF
+            </button>
+            <button
+              onClick={() => window.print()}
+              style={{
+                background: "transparent",
+                color: "#fff",
+                border: "1px solid rgba(255,255,255,0.4)",
+                borderRadius: 6,
+                padding: "8px 12px",
+                fontSize: 13,
+                fontWeight: 700,
+              }}
+            >
+              Print
+            </button>
+          </div>
         }
       />
       <div
+        id="cmp-report-page"
         className="print-page"
         style={{
           maxWidth: 740,
@@ -3875,7 +4213,7 @@ function ReportBlock({ title, children }) {
 }
 
 /* ====================== dossier screen ====================== */
-function DossierScreen({ vessel, reports, back }) {
+function DossierScreen({ vessel, reports, back, setToast }) {
   const first = reports[0];
   const last = reports[reports.length - 1];
   const hoursSeries = reports
@@ -3898,24 +4236,47 @@ function DossierScreen({ vessel, reports, back }) {
         sub="Vessel history dossier"
         onBack={back}
         right={
-          <button
-            onClick={() => window.print()}
-            style={{
-              background: C.brass,
-              color: "#fff",
-              border: "none",
-              borderRadius: 6,
-              padding: "8px 14px",
-              fontSize: 13,
-              fontWeight: 800,
-              textTransform: "uppercase",
-            }}
-          >
-            Print / PDF
-          </button>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button
+              onClick={() =>
+                exportPDF(
+                  "cmp-dossier-page",
+                  vessel.name + " - Service History",
+                  setToast
+                )
+              }
+              style={{
+                background: C.brass,
+                color: "#fff",
+                border: "none",
+                borderRadius: 6,
+                padding: "8px 14px",
+                fontSize: 13,
+                fontWeight: 800,
+                textTransform: "uppercase",
+              }}
+            >
+              Save PDF
+            </button>
+            <button
+              onClick={() => window.print()}
+              style={{
+                background: "transparent",
+                color: "#fff",
+                border: "1px solid rgba(255,255,255,0.4)",
+                borderRadius: 6,
+                padding: "8px 12px",
+                fontSize: 13,
+                fontWeight: 700,
+              }}
+            >
+              Print
+            </button>
+          </div>
         }
       />
       <div
+        id="cmp-dossier-page"
         className="print-page"
         style={{
           maxWidth: 740,
