@@ -931,17 +931,53 @@ async function exportPDF(elId, filename, setToast) {
     return;
   }
   if (setToast) setToast("Building PDF\u2026");
+  const safeName =
+    (filename || "report").replace(/[^a-z0-9 \-_]/gi, "").trim() + ".pdf";
   const opt = {
     margin: 0,
-    filename: filename + ".pdf",
+    filename: safeName,
     image: { type: "jpeg", quality: 0.92 },
     html2canvas: { scale: 2, useCORS: true, backgroundColor: "#ffffff" },
     jsPDF: { unit: "pt", format: "letter", orientation: "portrait" },
     pagebreak: { mode: ["css", "legacy"], avoid: ".report-item" },
   };
   try {
-    await window.html2pdf().set(opt).from(el).save();
-    if (setToast) setToast("PDF saved. Check your downloads or share sheet.");
+    const worker = window.html2pdf().set(opt).from(el);
+    // Try to open the iOS share sheet directly so the user can text/email it.
+    const blob = await worker.outputPdf("blob");
+    const file =
+      typeof File !== "undefined"
+        ? new File([blob], safeName, { type: "application/pdf" })
+        : null;
+    if (
+      file &&
+      navigator.canShare &&
+      navigator.canShare({ files: [file] }) &&
+      navigator.share
+    ) {
+      try {
+        await navigator.share({ files: [file], title: safeName });
+        if (setToast) setToast("Ready to send.");
+        return;
+      } catch (shareErr) {
+        // user cancelled share, or share failed -> fall through to download
+        if (shareErr && shareErr.name === "AbortError") {
+          if (setToast) setToast("");
+          return;
+        }
+      }
+    }
+    // Fallback: download the file and tell the user where it went.
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = safeName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    if (setToast)
+      setToast("PDF saved to Files \u203a Downloads. Open there to send.");
   } catch (e) {
     if (setToast) setToast("PDF failed. Use Print as a backup.");
   }
